@@ -21,7 +21,7 @@ A **Vue 3 + Vite + FastAPI** based sentiment analysis system for Xiaohongshu pro
 
 
 ### 🎨效果图
-![image]([https://github.com/Leonardo-Jay/xiaohongshu-agent-analyzer/具体例子.png](https://github.com/Leonardo-Jay/xiaohongshu-agent-analyzer/blob/011cf369e77e821651f4230d76df1ef99dd7f2fa/%E5%85%B7%E4%BD%93%E4%BE%8B%E5%AD%90.png))
+![image](https://github.com/Leonardo-Jay/xiaohongshu-agent-analyzer/blob/master/%E5%85%B7%E4%BD%93%E4%BE%8B%E5%AD%90.png))
 
 ### 技术栈
 
