@@ -23,24 +23,8 @@ A **Vue 3 + Vite + FastAPI** based sentiment analysis system for Xiaohongshu pro
 ### 🎨效果图
 ![image](https://github.com/Leonardo-Jay/xiaohongshu-agent-analyzer/blob/master/%E5%85%B7%E4%BD%93%E4%BE%8B%E5%AD%90.png))
 
-### 技术栈
-
-#### 前端
-- Vue 3
-- Vite
-- Element Plus
-- Vue Router
-- Pinia
-
-#### 后端
-- FastAPI
-- SSE（流式返回分析进度）
-- MCP
-- Python dotenv
-- httpx / requests
-
-#### 数据抓取
-- `Spider_XHS-master`（小红书抓取相关能力）
+### 数据抓取
+- 小红书数据采集基于 [Spider_XHS](https://github.com/cv-cat/Spider_XHS) 项目实现，感谢大佬[@cv-cat](https://github.com/cv-cat) 的开源贡献。
 
 ---
 
