@@ -29,6 +29,8 @@ async def retrieve_posts(state: GraphState, client: XhsMcpClient) -> dict[str, A
             posts = await client.search_posts(q, require_num=5)
         except Exception as e:
             logger.warning(f"[Retrieve] search_posts failed for '{q}': {e}")
+            if "登录已过期" in str(e) or "login" in str(e).lower():
+                raise RuntimeError("COOKIE_EXPIRED")
             continue
         for p in posts:
             if p.get("note_id") not in existing_ids:
@@ -41,7 +43,9 @@ async def retrieve_posts(state: GraphState, client: XhsMcpClient) -> dict[str, A
     # 并发拉取详情
     async def _enrich(post: dict) -> dict:
         try:
-            detail = await client.fetch_post_detail(post["note_url"])
+            url = post["note_url"]
+            logger.debug(f"[Retrieve] fetch_post_detail url={url}")
+            detail = await client.fetch_post_detail(url)
             return {**post, **detail}
         except Exception as e:
             logger.warning(f"[Retrieve] fetch detail failed {post.get('note_id')}: {e}")

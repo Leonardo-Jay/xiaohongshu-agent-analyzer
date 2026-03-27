@@ -11,6 +11,8 @@ if sys.platform == "win32":
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 load_dotenv()
@@ -53,3 +55,28 @@ app.include_router(analysis_router)
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# 生产环境：提供前端静态文件
+# ---------------------------------------------------------------------------
+_DIST = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "dist"
+)
+
+if os.path.isdir(_DIST):
+    _assets = os.path.join(_DIST, "assets")
+    if os.path.isdir(_assets):
+        app.mount("/assets", StaticFiles(directory=_assets), name="assets")
+
+    @app.get("/LOGO2.ico")
+    async def favicon():
+        return FileResponse(os.path.join(_DIST, "LOGO2.ico"))
+
+    @app.get("/config-guide.png")
+    async def config_guide():
+        return FileResponse(os.path.join(_DIST, "config-guide.png"))
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        return FileResponse(os.path.join(_DIST, "index.html"))

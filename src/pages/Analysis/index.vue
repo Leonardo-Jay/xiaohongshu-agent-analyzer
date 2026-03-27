@@ -42,7 +42,7 @@
           <el-button type="primary" :loading="loading" :disabled="!query.trim()" @click="startAnalysis">
             {{ loading ? '分析中…' : '重新分析' }}
           </el-button>
-          <el-button v-if="loading" @click="stopAnalysis">取消</el-button>
+          <el-button v-if="loading" @click="cancelAnalysis">取消</el-button>
         </div>
       </div>
 
@@ -50,6 +50,7 @@
         <div class="progress-inner">
           <div v-for="s in stages" :key="s.stage" class="stage-item">
             <el-icon v-if="s.done" color="#67c23a"><CircleCheckFilled /></el-icon>
+            <el-icon v-else-if="s.error" color="#f56c6c"><CircleCloseFilled /></el-icon>
             <el-icon v-else class="is-loading" color="#409eff"><Loading /></el-icon>
             <span class="stage-msg">{{ s.message }}</span>
             <el-progress
@@ -143,7 +144,7 @@
 <script setup>
 import { ref, computed, reactive } from 'vue'
 import { ElMessage } from 'element-plus'
-import { CircleCheckFilled, Loading } from '@element-plus/icons-vue'
+import { CircleCheckFilled, CircleCloseFilled, Loading } from '@element-plus/icons-vue'
 
 const query = ref('')
 const loading = ref(false)
@@ -159,6 +160,7 @@ const popover = reactive({ visible: false, top: 0, left: 0, data: {} })
 const configVisible = ref(false)
 const cookieInput = ref('')
 let _cookieChecked = false
+let _currentRunId = null
 
 function saveCookie() {
   configVisible.value = false
@@ -208,6 +210,13 @@ function stopAnalysis() {
   loading.value = false
 }
 
+async function cancelAnalysis() {
+  if (_currentRunId) {
+    try { await fetch(`/api/v1/analysis/cancel/${_currentRunId}`, { method: 'DELETE' }) } catch {}
+  }
+  stopAnalysis()
+}
+
 async function startAnalysis() {
   if (!query.value.trim()) return
 
@@ -241,11 +250,13 @@ async function startAnalysis() {
       body: JSON.stringify({ query: query.value.trim(), cookie: cookieInput.value.trim() || undefined }),
     })
     if (!resp.ok) {
-      const err = await resp.json()
-      throw new Error(err.detail || '启动分析失败')
+      let detail = `HTTP ${resp.status}`
+      try { const err = await resp.json(); detail = err.detail || detail } catch {}
+      throw new Error(detail)
     }
     const data = await resp.json()
     run_id = data.run_id
+    _currentRunId = run_id
   } catch (e) {
     ElMessage.error(e.message || '请求失败')
     loading.value = false
@@ -267,6 +278,14 @@ async function startAnalysis() {
   evtSource.addEventListener('error', (e) => {
     try {
       const d = JSON.parse(e.data)
+      if (d.code === 'COOKIE_EXPIRED') {
+        stopAnalysis()
+        _cookieChecked = false
+        _upsertStage('retrieve', 'Cookie 已过期，请点击右上角「配置 Cookie」按钮重新配置后再试', 0)
+        stages.value = stages.value.map(s => ({ ...s, done: false, error: s.stage === 'retrieve' }))
+        configVisible.value = true
+        return
+      }
       ElMessage.error(d.message || '分析失败')
     } catch {
       ElMessage.error('分析过程中发生错误')

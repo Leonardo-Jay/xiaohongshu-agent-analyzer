@@ -1,6 +1,7 @@
 # encoding: utf-8
 import json
 import re
+import sys
 import urllib
 import requests
 from xhs_utils.xhs_util import splice_str, generate_request_params, generate_x_b3_traceid, get_common_headers
@@ -363,8 +364,7 @@ class XHS_Apis():
         try:
             urlParse = urllib.parse.urlparse(url)
             note_id = urlParse.path.split("/")[-1]
-            kvs = urlParse.query.split('&')
-            kvDist = {kv.split('=')[0]: kv.split('=')[1] for kv in kvs}
+            kvDist = dict(urllib.parse.parse_qsl(urlParse.query))
             api = f"/api/sns/web/v1/feed"
             data = {
                 "source_note_id": note_id,
@@ -382,6 +382,7 @@ class XHS_Apis():
             headers, cookies, data = generate_request_params(cookies_str, api, data, 'POST')
             response = requests.post(self.base_url + api, headers=headers, data=data, cookies=cookies, proxies=proxies)
             res_json = response.json()
+            import sys; print(f"[get_note_info] status={response.status_code} res={str(res_json)[:200]}", file=sys.stderr, flush=True)
             success, msg = res_json.get("success", False), res_json.get("msg") or res_json.get("message", "unknown error")
         except Exception as e:
             success = False
@@ -512,6 +513,7 @@ class XHS_Apis():
             }
             headers, cookies, data = generate_request_params(cookies_str, api, data, 'POST')
             response = requests.post(self.base_url + api, headers=headers, data=data.encode('utf-8'), cookies=cookies, proxies=proxies)
+            print(f"[search_note] status={response.status_code} body={response.text[:500]}", file=sys.stderr, flush=True)
             res_json = response.json()
             success, msg = res_json["success"], res_json["msg"]
         except Exception as e:
@@ -633,12 +635,13 @@ class XHS_Apis():
             }
             splice_api = splice_str(api, params)
             headers, cookies, data = generate_request_params(cookies_str, splice_api, '', 'GET')
-            response = requests.get(self.base_url + splice_api, headers=headers, cookies=cookies, proxies=proxies)
+            response = requests.get(self.base_url + splice_api, headers=headers, cookies=cookies, proxies=proxies, timeout=15)
+            print(f"[get_note_out_comment] status={response.status_code} body={response.text[:500]}", file=sys.stderr, flush=True)
             res_json = response.json()
-            success, msg = res_json["success"], res_json["msg"]
+            success, msg = res_json["success"], res_json.get("msg", "")
         except Exception as e:
             success = False
-            msg = str(e)
+            msg = f"{e} | raw={res_json}"
         return success, msg, res_json
 
     def get_note_all_out_comment(self, note_id: str, xsec_token: str, cookies_str: str, proxies: dict = None):
@@ -655,13 +658,16 @@ class XHS_Apis():
                 success, msg, res_json = self.get_note_out_comment(note_id, cursor, xsec_token, cookies_str, proxies)
                 if not success:
                     raise Exception(msg)
-                comments = res_json["data"]["comments"]
-                if 'cursor' in res_json["data"]:
-                    cursor = str(res_json["data"]["cursor"])
+                data = res_json.get("data", {}) if res_json else {}
+                if not data:
+                    break
+                comments = data.get("comments", [])
+                if 'cursor' in data:
+                    cursor = str(data["cursor"])
                 else:
                     break
                 note_out_comment_list.extend(comments)
-                if len(note_out_comment_list) == 0 or not res_json["data"]["has_more"]:
+                if len(note_out_comment_list) == 0 or not data.get("has_more", False):
                     break
         except Exception as e:
             success = False
@@ -739,8 +745,7 @@ class XHS_Apis():
         try:
             urlParse = urllib.parse.urlparse(url)
             note_id = urlParse.path.split("/")[-1]
-            kvs = urlParse.query.split('&')
-            kvDist = {kv.split('=')[0]: kv.split('=')[1] for kv in kvs}
+            kvDist = dict(urllib.parse.parse_qsl(urlParse.query))
             success, msg, out_comment_list = self.get_note_all_out_comment(note_id, kvDist['xsec_token'], cookies_str, proxies)
             if not success:
                 raise Exception(msg)

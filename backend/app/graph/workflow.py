@@ -152,22 +152,28 @@ async def run_analysis(query: str, run_id: str, queue: asyncio.Queue, cookie: st
     except BaseException as e:
         exc_type = type(e).__name__
         exc_msg = repr(e)
-        try:
-            tb_text = traceback.format_exc() or ""
-            if tb_text.strip() and "NoneType: None" not in tb_text:
-                message = tb_text.strip()
-            else:
+        if "COOKIE_EXPIRED" in str(e):
+            queue.put_nowait({
+                "event": "error",
+                "data": {"code": "COOKIE_EXPIRED", "message": "小红书 Cookie 已过期，请重新配置"},
+            })
+        else:
+            try:
+                tb_text = traceback.format_exc() or ""
+                if tb_text.strip() and "NoneType: None" not in tb_text:
+                    message = tb_text.strip()
+                else:
+                    message = f"[{exc_type}] {exc_msg}"
+            except Exception:
                 message = f"[{exc_type}] {exc_msg}"
-        except Exception:
-            message = f"[{exc_type}] {exc_msg}"
-        if not message:
-            message = f"[{exc_type}] (no details)"
-        print(f"[WORKFLOW EXCEPT] {message}", file=sys.stderr, flush=True)
-        logger.error(f"[Workflow] run_id={run_id} FAILED: {message}")
-        queue.put_nowait({
-            "event": "error",
-            "data": {"code": "ANALYSIS_FAILED", "message": message},
-        })
+            if not message:
+                message = f"[{exc_type}] (no details)"
+            print(f"[WORKFLOW EXCEPT] {message}", file=sys.stderr, flush=True)
+            logger.error(f"[Workflow] run_id={run_id} FAILED: {message}")
+            queue.put_nowait({
+                "event": "error",
+                "data": {"code": "ANALYSIS_FAILED", "message": message},
+            })
         if not isinstance(e, Exception):
             raise
     finally:

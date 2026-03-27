@@ -23,7 +23,7 @@ from app.models.schemas import AnalysisRequest
 
 router = APIRouter(prefix="/api/v1/analysis", tags=["analysis"])
 
-# run_id -> {"queue": asyncio.Queue, "status": str, "query": str}
+# run_id -> {"queue": asyncio.Queue, "status": str, "query": str, "task": asyncio.Task}
 _tasks: dict[str, dict] = {}
 
 _QUEUE_TTL = 300  # 任务结果保留秒数
@@ -60,9 +60,9 @@ async def start_analysis(req: AnalysisRequestV2):
         raise HTTPException(status_code=409, detail="该 session_id 的任务正在执行中")
 
     q: asyncio.Queue = asyncio.Queue()
-    _tasks[run_id] = {"queue": q, "status": "running", "query": req.query}
-
-    asyncio.create_task(_run_and_cleanup(run_id, req.query, q, cookie=req.cookie))
+    _tasks[run_id] = {"queue": q, "status": "running", "query": req.query, "task": None}
+    task = asyncio.create_task(_run_and_cleanup(run_id, req.query, q, cookie=req.cookie))
+    _tasks[run_id]["task"] = task
     logger.info(f"[Routes] 任务启动 run_id={run_id} query={req.query}")
     return {"run_id": run_id, "query": req.query}
 
@@ -96,6 +96,23 @@ async def get_status(run_id: str):
         raise HTTPException(status_code=404, detail="run_id 不存在或已过期")
     task = _tasks[run_id]
     return {"run_id": run_id, "status": task["status"], "query": task["query"]}
+
+
+# ---------------------------------------------------------------------------
+# DELETE /cancel/{run_id}  — 取消任务
+# ---------------------------------------------------------------------------
+
+@router.delete("/cancel/{run_id}", summary="取消分析任务")
+async def cancel_analysis(run_id: str):
+    if run_id not in _tasks:
+        return {"cancelled": False}
+    entry = _tasks[run_id]
+    t = entry.get("task")
+    if t and not t.done():
+        t.cancel()
+    entry["status"] = "cancelled"
+    entry["queue"].put_nowait(None)
+    return {"cancelled": True}
 
 
 # ---------------------------------------------------------------------------
@@ -163,29 +180,16 @@ async def check_cookie(cookie: str | None = Query(None)):
     """
     检测 XHS Cookie 是否有效。
     优先使用 query param `cookie`，否则读 .env XHS_COOKIES。
+    通过解析 Cookie 字段判断有效性（检查 web_session 和 a1 是否存在）。
     返回 {"valid": bool, "source": "param"|"env"|"none"}
     """
-    import httpx
     xhs_cookie = cookie or os.getenv("XHS_COOKIES", "")
-    if not xhs_cookie:
+    if not xhs_cookie or not xhs_cookie.strip():
         return JSONResponse({"valid": False, "source": "none"})
     source = "param" if cookie else "env"
-    headers = {
-        "cookie": xhs_cookie,
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "referer": "https://www.xiaohongshu.com/",
-    }
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            resp = await c.get(
-                "https://edith.xiaohongshu.com/api/sns/web/v1/user/me",
-                headers=headers,
-            )
-        if resp.status_code == 461:
-            return JSONResponse({"valid": False, "source": source})
-        data = resp.json()
-        valid = data.get("code") == 0
-        return JSONResponse({"valid": valid, "source": source})
-    except Exception as e:
-        logger.warning(f"[check-cookie] 请求失败: {e}")
-        return JSONResponse({"valid": False, "source": source})
+    # 解析 cookie 字段，检查关键字段是否存在
+    sep = "; " if "; " in xhs_cookie else ";"
+    fields = {k.strip(): v for k, v in
+              (part.split("=", 1) if "=" in part else (part, "") for part in xhs_cookie.split(sep))}
+    valid = bool(fields.get("web_session") and fields.get("a1"))
+    return JSONResponse({"valid": valid, "source": source})

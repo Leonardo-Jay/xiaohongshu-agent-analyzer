@@ -25,6 +25,8 @@ def _load_js(filename):
 
 xray_js = _load_js('xhs_xray.js')
 
+_node_lock = __import__('threading').Lock()
+
 def generate_x_b3_traceid(len=16):
     x_b3_traceid = ""
     for t in range(len):
@@ -33,13 +35,14 @@ def generate_x_b3_traceid(len=16):
 
 def generate_xs_xs_common(a1, api, data='', method='POST'):
     payload = json.dumps({'api': api, 'data': data or '', 'a1': a1, 'method': method or 'POST'})
-    result = subprocess.run(
-        ['node', _RUNNER],
-        input=payload.encode('utf-8'),
-        capture_output=True,
-        timeout=30,
-        cwd=os.path.dirname(_RUNNER),  # 确保 require('crypto-js') 能找到 node_modules
-    )
+    with _node_lock:
+        result = subprocess.run(
+            ['node', _RUNNER],
+            input=payload.encode('utf-8'),
+            capture_output=True,
+            timeout=30,
+            cwd=os.path.dirname(_RUNNER),
+        )
     # stdout 可能含有 [Error] 等非 JSON 行，找第一个以 { 开头的行
     stdout_text = result.stdout.decode('utf-8', errors='replace')
     json_line = next((l for l in stdout_text.splitlines() if l.strip().startswith('{')), None)

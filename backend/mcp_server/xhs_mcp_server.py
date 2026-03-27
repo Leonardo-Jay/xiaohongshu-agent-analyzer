@@ -9,6 +9,9 @@ import asyncio
 import os
 import sys
 import json
+import socket
+
+socket.setdefaulttimeout(20)
 
 # 让 Python 能找到 Spider_XHS-master 的模块
 _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -27,11 +30,13 @@ from dotenv import load_dotenv
 from loguru import logger
 
 from apis.xhs_pc_apis import XHS_Apis
-from xhs_utils.data_util import handle_note_info, handle_comment_info
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 XHS_COOKIES = os.getenv("XHS_COOKIES", "")
+
+_proxy_url = os.getenv("XHS_PROXY", "").strip()
+XHS_PROXIES = {"http": _proxy_url, "https": _proxy_url} if _proxy_url else None
 
 xhs = XHS_Apis()
 server = Server("xhs-spider")
@@ -155,7 +160,7 @@ async def _search_posts(args: dict) -> dict:
     note_type = int(args.get("note_type", 0))
 
     success, msg, raw_list = await asyncio.to_thread(
-        xhs.search_some_note, query, require_num, XHS_COOKIES, sort_type, note_type
+        xhs.search_some_note, query, require_num, XHS_COOKIES, sort_type, note_type, 0, 0, 0, "", XHS_PROXIES
     )
     if not success:
         raise RuntimeError(f"search_some_note failed: {msg}")
@@ -187,33 +192,45 @@ async def _search_posts(args: dict) -> dict:
 
 async def _fetch_post_detail(args: dict) -> dict:
     note_url = args["note_url"]
-    success, msg, res_json = await asyncio.to_thread(xhs.get_note_info, note_url, XHS_COOKIES)
+    success, msg, res_json = await asyncio.to_thread(xhs.get_note_info, note_url, XHS_COOKIES, XHS_PROXIES)
+    logger.debug(f"[fetch_post_detail] url={note_url} success={success} msg={msg} raw={str(res_json)[:300]}")
     if not success:
         raise RuntimeError(f"get_note_info failed: {msg}")
     data = res_json.get("data", {}).get("items", [{}])[0]
-    info = handle_note_info(data)
+    card = data.get("note_card", {})
+    interact = card.get("interact_info", {})
+    user = card.get("user", {})
+    tags = [t.get("name", "") for t in card.get("tag_list", []) if t.get("type") == "topic"]
+    note_id = data.get("id") or data.get("note_card", {}).get("note_id", "")
     # 只保留分析所需字段
     return {
         "success": True,
         "note": {
-            "note_id": info["note_id"],
-            "title": info["title"],
-            "desc": info["desc"],
-            "note_type": info["note_type"],
-            "tags": info["tags"],
-            "like_count": info["liked_count"],
-            "comment_count": info["comment_count"],
-            "collect_count": info["collected_count"],
-            "upload_time": info["upload_time"],
-            "ip_location": info["ip_location"],
-            "author_nickname": info["nickname"],
+            "note_id": note_id,
+            "title": card.get("title", "") or "无标题",
+            "desc": card.get("desc", ""),
+            "note_type": "视频" if card.get("type") == "video" else "图集",
+            "tags": tags,
+            "like_count": interact.get("liked_count", 0),
+            "comment_count": interact.get("comment_count", 0),
+            "collect_count": interact.get("collected_count", 0),
+            "upload_time": card.get("time", ""),
+            "ip_location": card.get("ip_location", ""),
+            "author_nickname": user.get("nickname", ""),
         },
     }
 
 
 async def _search_comments(args: dict) -> dict:
     note_url = args["note_url"]
-    success, msg, raw_comments = await asyncio.to_thread(xhs.get_note_all_comment, note_url, XHS_COOKIES)
+    try:
+        success, msg, raw_comments = await asyncio.wait_for(
+            asyncio.to_thread(xhs.get_note_all_comment, note_url, XHS_COOKIES, XHS_PROXIES),
+            timeout=30
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"get_note_all_comment timed out after 30s")
+    logger.debug(f"[search_comments] url={note_url} success={success} msg={msg} raw_count={len(raw_comments) if raw_comments else 0} raw_sample={str(raw_comments)[:300]}")
     if not success:
         raise RuntimeError(f"get_note_all_comment failed: {msg}")
 
@@ -235,7 +252,7 @@ async def _fetch_comment_thread(args: dict) -> dict:
     xsec_token = args["xsec_token"]
 
     success, msg, out_comments = await asyncio.to_thread(
-        xhs.get_note_all_out_comment, note_id, xsec_token, XHS_COOKIES
+        xhs.get_note_all_out_comment, note_id, xsec_token, XHS_COOKIES, XHS_PROXIES
     )
     if not success:
         raise RuntimeError(f"get_note_all_out_comment failed: {msg}")
