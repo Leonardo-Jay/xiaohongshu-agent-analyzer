@@ -1,0 +1,4 @@
+# 告诉 GitHub Linguist 忽略静态/vendor JS 文件的语言统计
+Spider_XHS-master/static/*.js linguist-vendored
+Spider_XHS-master/node_modules/ linguist-vendored
+package-lock.json linguist-generated
