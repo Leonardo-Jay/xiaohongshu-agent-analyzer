@@ -139,7 +139,7 @@ async def stream_result(run_id: str):
         yield {"event": "ping", "data": json.dumps({"run_id": run_id}, ensure_ascii=False)}
         try:
             while True:
-                item = await asyncio.wait_for(q.get(), timeout=180)
+                item = await asyncio.wait_for(q.get(), timeout=600)
                 if item is None:
                     # 哨兵：流正常结束
                     yield {"event": "done", "data": json.dumps({"run_id": run_id}, ensure_ascii=False)}

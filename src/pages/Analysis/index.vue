@@ -64,6 +64,9 @@
             />
           </div>
         </div>
+        <div v-if="postReadingList.length > 0" class="post-reading-box">
+          <div v-for="(item, i) in postReadingList" :key="i" class="post-reading-item">{{ item }}</div>
+        </div>
       </div>
 
       <div v-if="result" class="result-wrap">
@@ -142,7 +145,7 @@
 </template>
 
 <script setup>
-import { ref, computed, reactive } from 'vue'
+import { ref, computed, reactive, watch, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
 import { CircleCheckFilled, CircleCloseFilled, Loading } from '@element-plus/icons-vue'
 
@@ -154,6 +157,12 @@ const result = ref(null)
 let evtSource = null
 const analyzeProgress = ref(60)
 let _analyzeTimer = null
+const postReadingList = ref([])
+watch(postReadingList, async () => {
+  await nextTick()
+  const box = document.querySelector('.post-reading-box')
+  if (box) box.scrollTop = box.scrollHeight
+}, { deep: true })
 
 const popover = reactive({ visible: false, top: 0, left: 0, data: {} })
 
@@ -172,6 +181,7 @@ function resetToHero() {
   started.value = false
   result.value = null
   stages.value = []
+  postReadingList.value = []
   _cookieChecked = false
 }
 
@@ -241,7 +251,7 @@ async function startAnalysis() {
   loading.value = true
   stages.value = []
   result.value = null
-
+  postReadingList.value = []
   let run_id
   try {
     const resp = await fetch('/api/v1/analysis/product', {
@@ -268,6 +278,11 @@ async function startAnalysis() {
   evtSource.addEventListener('progress', (e) => {
     const d = JSON.parse(e.data)
     _upsertStage(d.stage, d.message, d.progress)
+  })
+
+  evtSource.addEventListener('post_reading', (e) => {
+    const d = JSON.parse(e.data)
+    postReadingList.value.push(`第 ${d.index}/${d.total} 篇：${d.title}`)
   })
 
   evtSource.addEventListener('result', (e) => {
@@ -670,5 +685,21 @@ async function downloadWord() {
   width: 100%;
   border-radius: 6px;
   border: 1px solid #eee;
+}
+.post-reading-box {
+  margin-top: 8px;
+  max-height: 160px;
+  overflow-y: auto;
+  background: #f8f9fa;
+  border: 1px solid #e4e7ed;
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 13px;
+  color: #555;
+  line-height: 1.8;
+}
+.post-reading-item:last-child {
+  color: #409eff;
+  font-weight: 500;
 }
 </style>

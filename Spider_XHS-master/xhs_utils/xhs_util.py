@@ -42,6 +42,7 @@ def generate_xs_xs_common(a1, api, data='', method='POST'):
             capture_output=True,
             timeout=30,
             cwd=os.path.dirname(_RUNNER),
+            start_new_session=True,
         )
     # stdout 可能含有 [Error] 等非 JSON 行，找第一个以 { 开头的行
     stdout_text = result.stdout.decode('utf-8', errors='replace')

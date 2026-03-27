@@ -1,8 +1,3 @@
-"""Retrieve Agent — 搜索帖子并拉取详情，支持 expand_queries_fallback。
-实现 main_graph.py 中 tool_route_search / expand_queries_fallback 节点的真实逻辑。
-"""
-from __future__ import annotations
-
 import asyncio
 import json
 from typing import Any
@@ -17,8 +12,8 @@ from app.tools.mcp_client import XhsMcpClient
 _llm = create_llm(temperature=0)
 
 
-async def retrieve_posts(state: GraphState, client: XhsMcpClient) -> dict[str, Any]:
-    """遍历 query_plan，对每个词搜索最多 5 条帖子，合并去重，返回 retrieved_posts。"""
+async def retrieve_posts(state: GraphState, client: XhsMcpClient, queue: asyncio.Queue | None = None) -> dict[str, Any]:
+    """遍历 query_plan，对每个词搜索最多 10 条帖子，合并去重，返回 retrieved_posts。"""
     query_plan: list[str] = state.get("query_plan") or [state.get("user_query_raw", "")]
     existing_ids: set[str] = {p["note_id"] for p in state.get("retrieved_posts", [])}
     new_posts: list[dict[str, Any]] = []
@@ -26,7 +21,7 @@ async def retrieve_posts(state: GraphState, client: XhsMcpClient) -> dict[str, A
     for q in query_plan:
         logger.info(f"[Retrieve] 搜索: {q}")
         try:
-            posts = await client.search_posts(q, require_num=5)
+            posts = await client.search_posts(q, require_num=10)
         except Exception as e:
             logger.warning(f"[Retrieve] search_posts failed for '{q}': {e}")
             if "登录已过期" in str(e) or "login" in str(e).lower():
@@ -40,19 +35,27 @@ async def retrieve_posts(state: GraphState, client: XhsMcpClient) -> dict[str, A
     if not new_posts:
         return {"retrieved_posts": list(state.get("retrieved_posts", []))}
 
-    # 并发拉取详情
-    async def _enrich(post: dict) -> dict:
+    # 逐篇拉取详情，每篇完成后推送进度
+    enriched: list[dict] = []
+    total = len(new_posts)
+    for i, post in enumerate(new_posts):
         try:
             url = post["note_url"]
             logger.debug(f"[Retrieve] fetch_post_detail url={url}")
             detail = await client.fetch_post_detail(url)
-            return {**post, **detail}
+            merged = {**post, **detail}
         except Exception as e:
             logger.warning(f"[Retrieve] fetch detail failed {post.get('note_id')}: {e}")
-            return post
+            merged = post
+        enriched.append(merged)
+        if queue is not None:
+            title = merged.get("title") or merged.get("desc", "")[:20] or f"帖子 {i+1}"
+            queue.put_nowait({
+                "event": "post_reading",
+                "data": {"index": i + 1, "total": total, "title": title},
+            })
 
-    enriched = await asyncio.gather(*[_enrich(p) for p in new_posts])
-    combined = list(state.get("retrieved_posts", [])) + list(enriched)
+    combined = list(state.get("retrieved_posts", [])) + enriched
     logger.info(f"[Retrieve] 共获取 {len(combined)} 篇帖子")
     return {"retrieved_posts": combined}
 

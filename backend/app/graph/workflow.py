@@ -87,7 +87,7 @@ async def run_analysis(query: str, run_id: str, queue: asyncio.Queue, cookie: st
         async with XhsMcpClient() as client:
             # ── 3. Retrieve（带 fallback 回环）
             _progress(queue, "retrieve", "正在搜索小红书帖子...", 22)
-            updates = await retrieve_posts(state, client)
+            updates = await retrieve_posts(state, client, queue)
             state = {**state, **updates}
 
             attempts = 0
@@ -95,7 +95,7 @@ async def run_analysis(query: str, run_id: str, queue: asyncio.Queue, cookie: st
                 _progress(queue, "expand", f"搜索结果不足，正在扩展关键词（第 {attempts+1} 次）...", 28 + attempts * 4)
                 updates = await expand_queries_fallback(state)
                 state = {**state, **updates}
-                updates = await retrieve_posts(state, client)
+                updates = await retrieve_posts(state, client, queue)
                 state = {**state, **updates}
                 attempts += 1
 
