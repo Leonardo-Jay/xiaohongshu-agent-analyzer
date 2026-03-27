@@ -19,6 +19,10 @@ A **Vue 3 + Vite + FastAPI** based sentiment analysis system for Xiaohongshu pro
 - 前端展示分析过程与最终报告
 - 导出 Markdown / Word / PDF 报告
 
+
+### 🎨效果图
+![image](https://github.com/Leonardo-Jay/xiaohongshu-agent-analyzer/具体例子.png)
+
 ### 技术栈
 
 #### 前端
@@ -124,4 +128,5 @@ http://localhost:8001
 ```text
 http://localhost:8001/analysis
 ```
+### 注意⚠️本项目仅供学习交流使用，任何涉及数据注入的操作都是不被允许的，如有违反，后果自负。
 
