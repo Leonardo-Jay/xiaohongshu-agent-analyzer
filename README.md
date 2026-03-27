@@ -1,8 +1,8 @@
 # 小红书产品舆情分析系统 / Xiaohongshu Product Sentiment Analysis
 
-一个基于 **Vue 3 + Vite + FastAPI** 的小红书产品舆情分析系统。输入产品关键词后，系统会抓取小红书相关帖子与评论，生成结构化口碑分析报告。
+基于多Agent协作的小红书产品舆情分析系统。通过MCP协议封装外部数据源，利用大模型Function Calling实现自动化任务编排。输入产品关键词，自动抓取相关帖子与评论，生成结构化口碑分析报告。
 
-A **Vue 3 + Vite + FastAPI** based sentiment analysis system for Xiaohongshu product discussions. Enter a product keyword, and the system retrieves related posts/comments and generates a structured analysis report.
+A multi-agent sentiment analysis system for Xiaohongshu product discussions. Uses MCP protocol for external data sources and LLM function calling for automated task orchestration. Enter a product keyword to retrieve posts/comments and generate structured analysis reports.
 
 ---
 
