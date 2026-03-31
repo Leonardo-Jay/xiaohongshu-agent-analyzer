@@ -103,7 +103,7 @@ OPINION_PROMPT = """
 """
 
 SYNTHESIS_META_PROMPT = """
-你是舆情分析师，基于以下数据评估本次分析的质量。
+你是舆情分析师，基于以下数据给本次分析打分。
 
 用户查询: {query}
 帖子数: {post_count}，评论数: {comment_count}
@@ -111,6 +111,7 @@ SYNTHESIS_META_PROMPT = """
 
 打分规则（不要过度保守）：
 - 有帖子且有十条以上评论：confidence_score ≥ 0.6
+- 只要有帖子/评论：confidence_score >0.4
 
 
 只返回 JSON，不要其他文字：
