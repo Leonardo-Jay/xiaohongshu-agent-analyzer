@@ -1,0 +1,29 @@
+[33mcommit 2d8f87f8ebd4b9ea1a48aab9e94c9cad33bcbdad[m
+Author: Leonardo-Jay <jbxasd@163.com>
+Date:   Tue Mar 31 17:22:28 2026 +0800
+
+    优化前端UI和观点簇匹配机制，增加后端日志
+
+[33mcommit f4ae6546e6ad91e8654e2ce9b0fd85e6fa9dc3f0[m
+Author: Leonardo-Jay <jbxasd@163.com>
+Date:   Fri Mar 27 17:11:32 2026 +0800
+
+    修改前端交互
+
+[33mcommit 61fb23b7fb17743c2fd38d2012a4f7d9a9b97567[m
+Author: Leonardo-Jay <jbxasd@163.com>
+Date:   Fri Mar 27 16:54:58 2026 +0800
+
+    Add .env file with configuration variables
+
+[33mcommit 2888802ebaddc532a41374895145e7fb977daa52[m
+Author: Leonardo-Jay <jbxasd@163.com>
+Date:   Fri Mar 27 16:11:18 2026 +0800
+
+    修改错误
+
+[33mcommit ff44292dc1794e75a51e54db48be141c4bbd1ac6[m
+Author: Leonardo-Jay <jbxasd@163.com>
+Date:   Thu Mar 26 20:44:59 2026 +0800
+
+    Initial commit
