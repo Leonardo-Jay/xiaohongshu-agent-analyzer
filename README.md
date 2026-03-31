@@ -21,7 +21,7 @@ A multi-agent sentiment analysis system for Xiaohongshu product discussions. Use
 
 
 ### 🎨效果图
-![image](https://github.com/Leonardo-Jay/xiaohongshu-agent-analyzer/blob/master/%E5%85%B7%E4%BD%93%E4%BE%8B%E5%AD%90.png))
+![image](https://github.com/Leonardo-Jay/xiaohongshu-agent-analyzer/blob/master/example.jpg))
 
 ### 数据抓取
 - 小红书数据采集基于 [Spider_XHS](https://github.com/cv-cat/Spider_XHS) 项目实现，感谢大佬[@cv-cat](https://github.com/cv-cat) 的开源贡献。
