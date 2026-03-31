@@ -37,7 +37,7 @@ venv/
 .pytest_cache/
 
 # 敏感配置（包含真实 Cookie 和 API Token）
-#backend/.env
+backend/.env
 
 # Claude Code 本地配置
 .claude/
