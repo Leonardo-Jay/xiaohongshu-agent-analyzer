@@ -7,7 +7,7 @@ from typing import Any
 import httpx
 
 
-DEFAULT_MODEL = "qwen3-14b"
+DEFAULT_MODEL = "ernie-4.5-21b-a3b"
 DEFAULT_API_URL = "https://qianfan.baidubce.com/v2/chat/completions"
 
 

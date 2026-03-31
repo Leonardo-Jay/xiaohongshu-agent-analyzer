@@ -109,8 +109,12 @@ SYNTHESIS_META_PROMPT = """
 帖子数: {post_count}，评论数: {comment_count}
 观点聚类: {clusters_json}
 
+打分规则（不要过度保守）：
+- 有帖子且有十条以上评论：confidence_score ≥ 0.6
+
+
 只返回 JSON，不要其他文字：
-{{"confidence_score": 0.0至1.0的数字, "limitations": "局限性说明（1-2句）"}}
+{{"confidence_score": 0.0至1.0的数字, "limitations": "5个字说明"}}
 """
 
 SYNTHESIS_REPORT_PROMPT = """
