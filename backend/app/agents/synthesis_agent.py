@@ -57,7 +57,9 @@ def _strip_fences(text: str) -> str:
 
 
 async def synthesize(state: GraphState) -> dict[str, Any]:
-    """两次并发 LLM 调用：meta（小型 JSON）+ report（纯 Markdown）。"""
+    """仅从 clusters 构建 references + 规则计算置信度。
+    报告生成已由 synthesize_from_streaming 流式完成。
+    """
     clusters = state.get("clusters", [])
     post_count = len(state.get("screened_items", []))
     comment_count = len(state.get("retrieved_comments", []))
@@ -67,48 +69,18 @@ async def synthesize(state: GraphState) -> dict[str, Any]:
             "final_answer": "## 分析结果\n\n未找到与查询相关的内容，请尝试更换关键词。",
             "confidence_score": 0.0,
             "limitations": ["搜索结果为空，无法进行舆情分析。"],
+            "references": [],
         }
 
-    clusters_json = json.dumps(clusters, ensure_ascii=False, indent=2)
-    fmt_args = dict(
-        query=state.get("user_query_raw", ""),
-        post_count=post_count,
-        comment_count=comment_count,
-        clusters_json=clusters_json,
-    )
-
-    meta_prompt = SYNTHESIS_META_PROMPT.format(**fmt_args)
-    report_prompt = SYNTHESIS_REPORT_PROMPT.format(**fmt_args)
-
-    try:
-        meta_resp, report_resp = await asyncio.gather(
-            _llm_meta.ainvoke(meta_prompt),
-            _llm_report.ainvoke(report_prompt),
-        )
-    except Exception as e:
-        logger.error(f"[Synthesis] LLM 调用失败: {e}")
-        return {
-            "final_answer": "## 分析失败\n\n生成报告时发生内部错误，请稍后重试。",
-            "confidence_score": 0.0,
-            "limitations": [str(e)],
-        }
-
-    # 解析 meta（小型 JSON）
-    confidence_score = 0.5
-    limitations: list[str] = []
-    try:
-        meta = json.loads(_fix_llm_json(meta_resp.content))
-        confidence_score = float(meta.get("confidence_score", 0.5))
-        lim = meta.get("limitations", "")
-        if lim:
-            limitations = [lim]
-    except Exception as e:
-        logger.warning(f"[Synthesis] meta JSON 解析失败（忽略）: {e}")
-
-    # 报告：纯 Markdown，直接使用
-    final_answer = _strip_fences(report_resp.content)
-    if not final_answer:
-        final_answer = "## 分析完成\n\n报告内容为空，请重试。"
+    # 规则置信度（不再调用 LLM，避免额外等待）
+    if post_count >= 5 and comment_count >= 30:
+        confidence_score = 0.8
+    elif post_count >= 3 and comment_count >= 10:
+        confidence_score = 0.65
+    elif post_count >= 2:
+        confidence_score = 0.5
+    else:
+        confidence_score = 0.35
 
     # 从 clusters 构建结构化 references，供前端展示原贴引用
     seen: set[str] = set()
@@ -129,10 +101,51 @@ async def synthesize(state: GraphState) -> dict[str, Any]:
             "quotes": cl.get("evidence_quotes", []),
         })
 
-    logger.info(f"[Synthesis] 报告生成完毕，字数={len(final_answer)}，引用数={len(references)}")
+    logger.info(f"[Synthesis] references={len(references)}，置信度={confidence_score}")
     return {
-        "final_answer": final_answer,
         "confidence_score": confidence_score,
-        "limitations": limitations,
+        "limitations": [],
         "references": references,
     }
+
+
+async def synthesize_from_streaming(state: GraphState, queue) -> dict:
+    """流式生成报告：边生成边推送 chunks 给前端，返回完整报告文本。
+
+    此函数生成报告的完整 markdown 文本并实时推送到队列。
+    references 等元数据仍然通过原来 synthesize() 返回。
+    """
+    clusters = state.get("clusters", [])
+    post_count = len(state.get("screened_items", []))
+    comment_count = len(state.get("retrieved_comments", []))
+
+    if not clusters and post_count == 0:
+        return {"final_answer": ""}
+
+    clusters_json = json.dumps(clusters, ensure_ascii=False)
+    fmt_args = dict(
+        query=state.get("user_query_raw", ""),
+        post_count=post_count,
+        comment_count=comment_count,
+        clusters_json=clusters_json,
+    )
+    report_prompt = SYNTHESIS_REPORT_PROMPT.format(**fmt_args)
+
+    try:
+        buffer = ""
+        async for chunk in _llm_report.astream(report_prompt):
+            buffer += chunk
+            # 清理 markdown 围栏后推送当前缓冲
+            cleaned = _strip_fences(buffer)
+            queue.put_nowait({
+                "event": "report_chunk",
+                "data": {"text": cleaned},
+            })
+        final_answer = _strip_fences(buffer)
+        if not final_answer:
+            final_answer = "## 分析完成\n\n报告内容为空，请重试。"
+        logger.info(f"[Synthesis] 流式报告生成完毕，字数={len(final_answer)}")
+        return {"final_answer": final_answer}
+    except Exception as e:
+        logger.error(f"[Synthesis] 流式报告生成失败: {e}")
+        return {"final_answer": f"## 分析失败\n\n流式生成报告时出错: {str(e)}"}

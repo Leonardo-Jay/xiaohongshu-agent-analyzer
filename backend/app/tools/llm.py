@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, AsyncIterator
 
 import httpx
+import json
 
 
 DEFAULT_MODEL = "ernie-4.5-21b-a3b"
@@ -54,6 +55,40 @@ class QianfanChatAdapter:
 
         text = self._extract_content(data)
         return LLMResponse(content=self._normalize_text(text))
+
+    async def astream(self, prompt: str) -> AsyncIterator[str]:
+        """流式调用，返回文本块（yield chunk）。"""
+        if not self.bearer_token:
+            raise RuntimeError("缺少 QIANFAN_BEARER_TOKEN，无法调用千帆模型")
+
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.temperature,
+            "stream": True,
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.bearer_token}",
+        }
+
+        async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
+            async with client.stream("POST", self.api_url, headers=headers, json=payload) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:]
+                    if data.strip() in ("[DONE]", ""):
+                        break
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        if delta:
+                            yield delta
+                    except:
+                        continue
 
     @staticmethod
     def _extract_content(data: dict[str, Any]) -> str:

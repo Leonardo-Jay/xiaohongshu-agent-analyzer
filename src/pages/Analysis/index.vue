@@ -69,12 +69,12 @@
         </div>
       </div>
 
-      <div v-if="result" class="result-wrap">
+      <div v-if="reportBuffer || result" class="result-wrap">
         <div class="result-meta">
           <div class="meta-tags">
-            <el-tag type="success">置信度 {{ (result.confidence_score * 100).toFixed(0) }}%</el-tag>
-            <el-tag style="margin-left:8px">分析帖子 {{ result.screened_count }} 篇</el-tag>
-            <el-tag style="margin-left:8px">分析评论 {{ result.comment_count }} 条</el-tag>
+            <el-tag type="success">置信度 {{ ((result?.confidence_score || 0) * 100).toFixed(0) }}%</el-tag>
+            <el-tag style="margin-left:8px">分析帖子 {{ result?.screened_count ?? '—' }} 篇</el-tag>
+            <el-tag style="margin-left:8px">分析评论 {{ result?.comment_count ?? '—' }} 条</el-tag>
           </div>
           <div class="meta-actions">
             <el-button size="small" @click="copyMarkdown">复制 Markdown</el-button>
@@ -83,7 +83,14 @@
           </div>
         </div>
 
-        <div class="report-sections">
+        <!-- 流式加载中：显示累积报告文本 -->
+        <div v-if="reportBuffer && !result" class="streaming-report">
+          <div class="section-main" v-html="renderMd(reportBuffer)" />
+          <div class="streaming-indicator">报告生成中…<span class="dot-dot-dot"><span>.</span><span>.</span><span>.</span></span></div>
+        </div>
+
+        <!-- 报告完成：按章节分栏 + 引用 -->
+        <div v-else-if="result" class="report-sections">
           <div v-for="(sec, si) in sectionRows" :key="si" class="section-row" :style="{ animationDelay: si * 0.06 + 's' }">
             <div class="section-main" v-html="renderMd(sec.raw)" />
             <div class="section-aside" v-if="sec.refs.length">
@@ -154,6 +161,8 @@ const loading = ref(false)
 const started = ref(false)
 const stages = ref([])
 const result = ref(null)
+const reportBuffer = ref('')
+let hasScrolledToReport = false
 
 // 报告生成后自动滚动到结果区域（预留顶部空间避免被导航栏遮挡）
 watch(result, async (val) => {
@@ -166,6 +175,20 @@ watch(result, async (val) => {
     window.scrollTo({ top, behavior: 'smooth' })
   }
 })
+
+// 流式报告出现时自动滚动（仅首次触发一次）
+watch(reportBuffer, async (val) => {
+  if (!val || hasScrolledToReport) return
+  hasScrolledToReport = true
+  await nextTick()
+  const el = document.querySelector('.result-wrap')
+  if (el) {
+    const offset = 40
+    const top = el.getBoundingClientRect().top + window.pageYOffset - offset
+    window.scrollTo({ top, behavior: 'smooth' })
+  }
+}, { flush: 'post' })
+
 let evtSource = null
 const analyzeProgress = ref(60)
 let _analyzeTimer = null
@@ -198,6 +221,8 @@ function resetToHero() {
   stopAnalysis()
   started.value = false
   result.value = null
+  reportBuffer.value = ''
+  hasScrolledToReport = false
   stages.value = []
   postReadingList.value = []
   _cookieChecked = false
@@ -269,6 +294,8 @@ async function startAnalysis() {
   loading.value = true
   stages.value = []
   result.value = null
+  reportBuffer.value = ''
+  hasScrolledToReport = false
   postReadingList.value = []
   let run_id
   try {
@@ -301,6 +328,12 @@ async function startAnalysis() {
   evtSource.addEventListener('post_reading', (e) => {
     const d = JSON.parse(e.data)
     postReadingList.value.push(`第 ${d.index}/${d.total} 篇：${d.title}`)
+  })
+
+  // 流式报告内容
+  evtSource.addEventListener('report_chunk', (e) => {
+    const d = JSON.parse(e.data)
+    reportBuffer.value = d.text
   })
 
   evtSource.addEventListener('result', (e) => {
@@ -657,6 +690,32 @@ async function downloadWord() {
 }
 .meta-tags { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 .meta-actions { display: flex; gap: 6px; }
+/* ── Streaming report ── */
+.streaming-report {
+  padding: 0 28px;
+  min-height: 200px;
+  line-height: 1.9;
+  font-size: 15px;
+  color: #111827;
+}
+.streaming-indicator {
+  margin-top: 24px;
+  color: #3B82F6;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.dot-dot-dot span {
+  animation: bounce 1.4s infinite ease-in-out both;
+  display: inline-block;
+}
+.dot-dot-dot span:nth-child(1) { animation-delay: -0.32s; }
+.dot-dot-dot span:nth-child(2) { animation-delay: -0.16s; }
+@keyframes bounce {
+  0%, 80%, 100% { transform: scale(0); }
+  40% { transform: scale(1); }
+}
 .report-sections {
   display: flex;
   flex-direction: column;

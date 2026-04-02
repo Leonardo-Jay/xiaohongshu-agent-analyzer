@@ -22,7 +22,7 @@ from app.agents.orchestrator_agent import classify_intent, rewrite_and_plan
 from app.agents.retrieve_agent import retrieve_posts, expand_queries_fallback
 from app.agents.screen_agent import screen_posts
 from app.agents.analyze_agent import fetch_and_analyze
-from app.agents.synthesis_agent import synthesize
+from app.agents.synthesis_agent import synthesize, synthesize_from_streaming
 from app.models.schemas import GraphState
 from app.tools.mcp_client import XhsMcpClient, XhsMcpClientPool
 from app.utils.daily_audit_log import append_audit_log
@@ -131,7 +131,7 @@ async def run_analysis(query: str, run_id: str, queue: asyncio.Queue, cookie: st
             _progress(queue, "screen", f"筛选出 {len(screened)} 篇相关帖子", 52)
 
         # ── 5. Analyze（连接池并发：只启动3个 MCP 子进程，所有帖子共享）
-        _progress(queue, "analyze", "正在并发获取评论并分析舆情...", 56)
+        _progress(queue, "analyze", "正在并发获取评论并分析舆情（最长约1分钟）...", 56)
         pool_size = int(os.getenv("MCP_POOL_SIZE", "2"))
         pool_size = max(1, min(pool_size, len(state.get("screened_items", [])) or 1))
         async with XhsMcpClientPool(size=pool_size, cookie=cookie) as pool:
@@ -144,8 +144,12 @@ async def run_analysis(query: str, run_id: str, queue: asyncio.Queue, cookie: st
 
         # ── 6. Synthesize
         _progress(queue, "synthesize", "正在生成分析报告...", 82)
-        updates = await synthesize(state)
-        state = {**state, **updates}
+        # 流式生成报告文本（边生成边推送 chunks）
+        updates_stream = await synthesize_from_streaming(state, queue)
+        state = {**state, **updates_stream}
+        # references 生成（无 LLM 调用，纯 CPU 计算，瞬间完成）
+        updates_meta = await synthesize(state)
+        state = {**state, **updates_meta}
         _progress(queue, "synthesize", "报告生成完毕", 97)
 
         # ── 推送最终结果（references 由 synthesis_agent 生成）

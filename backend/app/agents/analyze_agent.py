@@ -145,7 +145,21 @@ async def fetch_and_analyze(state: GraphState, pool: XhsMcpClientPool) -> dict[s
     desc_only_posts = posts_sorted[3:]
     comment_tasks = [_process_post(p, state, pool) for p in comment_posts]
     desc_tasks = [_process_post_desc_only(p, state) for p in desc_only_posts]
-    results = await asyncio.gather(*comment_tasks, *desc_tasks)
+
+    # 硬性限时 40 秒，超时也返回已拿到的部分结果
+    all_tasks = [asyncio.create_task(t) for t in comment_tasks + desc_tasks]
+    _, not_done = await asyncio.wait(all_tasks, timeout=40)
+    for t in not_done:
+        t.cancel()
+    if not_done:
+        await asyncio.gather(*not_done, return_exceptions=True)
+
+    results: list[tuple] = []
+    for t in all_tasks:
+        if t.done() and not t.exception():
+            results.append(t.result())
+        else:
+            results.append(([], []))
 
     all_comments: list[dict] = []
     all_clusters: list[dict] = []
