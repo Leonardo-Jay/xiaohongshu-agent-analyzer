@@ -470,8 +470,20 @@ function sentimentTag(s) {
 const pdfLoading = ref(false)
 
 async function copyMarkdown() {
-  await navigator.clipboard.writeText(result.value.final_answer || '')
-  ElMessage.success('已复制 Markdown')
+  // 优先复制已完成的完整报告，如果报告还在生成中，复制当前的 buffer
+  const content = reportBuffer.value || result.value?.final_answer || '';
+  if (!content) {
+    ElMessage.warning('报告尚未生成');
+    return;
+  }
+  
+  try {
+    await navigator.clipboard.writeText(content);
+    ElMessage.success('已复制完整 Markdown');
+  } catch (err) {
+    ElMessage.error('复制失败');
+    console.error(err);
+  }
 }
 
 async function downloadPdf() {

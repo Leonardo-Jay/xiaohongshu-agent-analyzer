@@ -48,7 +48,7 @@ class QianfanChatAdapter:
             "Authorization": f"Bearer {self.bearer_token}",
         }
 
-        async with httpx.AsyncClient(timeout=self.timeout, trust_env=False) as client:
+        async with httpx.AsyncClient(timeout=40.0, trust_env=False) as client:
             resp = await client.post(self.api_url, headers=headers, json=payload)
             resp.raise_for_status()
             data = resp.json()

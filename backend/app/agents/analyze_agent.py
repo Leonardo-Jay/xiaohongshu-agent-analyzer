@@ -146,20 +146,19 @@ async def fetch_and_analyze(state: GraphState, pool: XhsMcpClientPool) -> dict[s
     comment_tasks = [_process_post(p, state, pool) for p in comment_posts]
     desc_tasks = [_process_post_desc_only(p, state) for p in desc_only_posts]
 
-    # 硬性限时 40 秒，超时也返回已拿到的部分结果
-    all_tasks = [asyncio.create_task(t) for t in comment_tasks + desc_tasks]
-    _, not_done = await asyncio.wait(all_tasks, timeout=40)
-    for t in not_done:
-        t.cancel()
-    if not_done:
-        await asyncio.gather(*not_done, return_exceptions=True)
-
-    results: list[tuple] = []
-    for t in all_tasks:
-        if t.done() and not t.exception():
-            results.append(t.result())
+    # 替换原有的 asyncio.wait_for 块为以下稳健的 gather 实现
+    # 使用 return_exceptions=True 确保个别任务失败不会阻塞整体流程
+    results = await asyncio.gather(*comment_tasks, *desc_tasks, return_exceptions=True)
+    
+    # 统一处理结果：将所有异常转化为空结果 ([], [])，防止程序崩溃
+    final_results = []
+    for r in results:
+        if isinstance(r, Exception):
+            logger.warning(f"[Analyze] 任务执行出错: {r}")
+            final_results.append(([], []))
         else:
-            results.append(([], []))
+            final_results.append(r)
+    results = final_results
 
     all_comments: list[dict] = []
     all_clusters: list[dict] = []
