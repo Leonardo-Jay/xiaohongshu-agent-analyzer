@@ -78,14 +78,14 @@ npm install
 
 #### 4）配置环境变量
 
-直接在 `backend/.env` 中填写配置：
+直接在`backend/'目录下创建'.env'文件，然后 在`backend/.env`中填写配置：
 
 ```env
 XHS_COOKIES=你的小红书 Cookie
 QIANFAN_BEARER_TOKEN=你的千帆 Token
 QIANFAN_BASE_URL=https://qianfan.baidubce.com/v2/chat/completions
-QIANFAN_MODEL=qwen3-14b
-MCP_POOL_SIZE=2
+QIANFAN_MODEL=ernie-4.5-21b-a3b  #指定llm模型型号，参考百度云LLM文档
+MCP_POOL_SIZE=2 # MCP 连接池大小/可修改
 ```
 
 #### 5）启动后端

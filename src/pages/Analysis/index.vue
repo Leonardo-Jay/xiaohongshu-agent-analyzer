@@ -94,6 +94,7 @@
           <div v-for="(sec, si) in sectionRows" :key="si" class="section-row" :style="{ animationDelay: si * 0.06 + 's' }">
             <div class="section-main" v-html="renderMd(sec.raw)" />
             <div class="section-aside" v-if="sec.refs.length">
+              <div class="aside-header" v-if="si === 1">参考内容</div>
               <div
                 v-for="(ref, ri) in sec.refs"
                 :key="ri"
@@ -448,9 +449,16 @@ const sectionRows = computed(() => {
 function showPopover(ref, event) {
   const rect = event.currentTarget.getBoundingClientRect()
   popover.data = ref
-  popover.top = rect.top
-  popover.left = rect.left - 270
-  if (popover.left < 8) popover.left = rect.right + 8
+  
+  // 原来的 top 是 rect.top，改动后：
+  // rect.top 是链接顶部，popover 本身高度假设是 200px
+  // 减去一定像素使其显示在上方。
+  // 注意：如果你的 popover 组件有固定高度，建议 top = rect.top - 浮窗高度 - 间距
+  popover.top = rect.top - 100; // 修改这里，让浮窗上移 180 像素（根据你的实际浮窗高度调整）
+  
+  // 保持在原处或居中对齐链接
+  popover.left = rect.left;
+  
   popover.visible = true
 }
 
@@ -555,6 +563,18 @@ async function downloadWord() {
 @keyframes slideDown {
   from { opacity: 0; transform: translateY(-16px); }
   to   { opacity: 1; transform: translateY(0); }
+}
+
+.aside-header {
+  background: #eefaff;  /* 浅灰色圆角横条 */
+  color: #55555e;       /* 文字深灰 */
+  font-size: 13px;
+  font-weight: 380;
+  text-align: center;
+  padding: 1px 0;
+  margin-bottom: 8px;
+  border-radius: 10px;
+  letter-spacing: 0.5px;
 }
 
 /* ── Hero ── */
