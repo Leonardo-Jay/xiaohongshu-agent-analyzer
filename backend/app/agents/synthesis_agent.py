@@ -131,21 +131,32 @@ async def synthesize_from_streaming(state: GraphState, queue) -> dict:
     )
     report_prompt = SYNTHESIS_REPORT_PROMPT.format(**fmt_args)
 
-    try:
-        buffer = ""
-        async for chunk in _llm_report.astream(report_prompt):
-            buffer += chunk
-            # 清理 markdown 围栏后推送当前缓冲
-            cleaned = _strip_fences(buffer)
-            queue.put_nowait({
-                "event": "report_chunk",
-                "data": {"text": cleaned},
-            })
-        final_answer = _strip_fences(buffer)
-        if not final_answer:
-            final_answer = "## 分析完成\n\n报告内容为空，请重试。"
-        logger.info(f"[Synthesis] 流式报告生成完毕，字数={len(final_answer)}")
-        return {"final_answer": final_answer}
-    except Exception as e:
-        logger.error(f"[Synthesis] 流式报告生成失败: {e}")
-        return {"final_answer": f"## 分析失败\n\n流式生成报告时出错: {str(e)}"}
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            buffer = ""
+            async for chunk in _llm_report.astream(report_prompt):
+                buffer += chunk
+                cleaned = _strip_fences(buffer)
+                queue.put_nowait({
+                    "event": "report_chunk",
+                    "data": {"text": cleaned},
+                })
+            
+            final_answer = _strip_fences(buffer)
+            if not final_answer:
+                final_answer = "## 分析完成\n\n报告内容为空，请重试。"
+            logger.info(f"[Synthesis] 流式报告生成成功，字数={len(final_answer)}")
+            return {"final_answer": final_answer}
+
+        except Exception as e:
+            import traceback
+            error_details = traceback.format_exc()
+            logger.error(f"[Synthesis] 流式生成第 {attempt+1} 次失败: {str(e)}\n{error_details}")
+            
+            if attempt < max_retries:
+                queue.put_nowait({"event": "progress", "data": {"message": f"报告生成重试中 ({attempt+1}/{max_retries})...", "progress": 82}})
+                await asyncio.sleep(2)  # 等待 2 秒后重试
+            else:
+                queue.put_nowait({"event": "progress", "data": {"message": "报告生成失败，请重试", "progress": 82}})
+                return {"final_answer": f"## 分析出错\n\n流式生成报告重试多次后仍失败，建议检查网络或密钥。错误详情: {str(e)}"}
