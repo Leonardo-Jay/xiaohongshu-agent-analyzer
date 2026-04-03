@@ -79,7 +79,7 @@
           <div class="meta-actions">
             <el-button size="small" @click="copyMarkdown">复制 Markdown</el-button>
             <el-button size="small" @click="downloadWord">下载 Word</el-button>
-            <el-button size="small" type="primary" @click="downloadPdf" :loading="pdfLoading">下载 PDF</el-button>
+            <el-button size="small" @click="downloadPdf" :loading="pdfLoading">下载 PDF</el-button>
           </div>
         </div>
 
@@ -567,8 +567,8 @@ async function downloadWord() {
 
 .aside-header {
   background: #eefaff;  /* 浅灰色圆角横条 */
-  color: #55555e;       /* 文字深灰 */
-  font-size: 13px;
+  color: #3c3c5e;       /* 文字深灰 */
+  font-size: 14px;
   font-weight: 380;
   text-align: center;
   padding: 1px 0;
