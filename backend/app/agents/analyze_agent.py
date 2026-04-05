@@ -253,23 +253,33 @@ async def node_fetch_comments(state: GraphState, config: dict) -> dict[str, Any]
 
         return comments, clusters
 
-    # 40 秒总超时控制 —— 使用 asyncio.wait_for 包裹每个独立任务，确保超时后仍能保留已完成的结果
+    # 40 秒总超时控制 —— 使用 asyncio.wait 下向兼容高低版本 Python
     all_new_comments: list[dict] = []
     all_new_clusters: list[dict] = []
 
-    # 为每个帖子创建独立的任务，使用 wait_for 单独限制每个任务的超时
+    # 为每个帖子创建独立的任务
     tasks = [asyncio.create_task(_process_post(p)) for p in target_posts]
     done_results: list[tuple[list[dict], list[dict]]] = []
 
-    try:
-        async with asyncio.timeout(40):
-            # 使用 as_completed 逐步收集已完成的结果
-            for coro in asyncio.as_completed(tasks):
-                result = await coro
+    if tasks:
+        # 使用 asyncio.wait 替代 asyncio.timeout 兼容 Python 3.10
+        done_tasks, pending_tasks = await asyncio.wait(
+            tasks,
+            timeout=40.0,
+            return_when=asyncio.ALL_COMPLETED
+        )
+
+        for task in done_tasks:
+            try:
+                result = task.result()
                 done_results.append(result)
-    except asyncio.TimeoutError:
-        logger.warning("[Analyze][FetchComments] 40 秒超时，但保留已完成的评论结果")
-        # 注意：as_completed 在超时前已 yield 的结果会被收集，只有未完成的任务会被取消
+            except Exception as e:
+                logger.warning(f"[Analyze][FetchComments] 处理已完成任务时遇到异常: {e}")
+
+        if pending_tasks:
+            logger.warning(f"[Analyze][FetchComments] 40 秒超时，保留已完成评论。取消 {len(pending_tasks)} 个未完成任务。")
+            for p_task in pending_tasks:
+                p_task.cancel()
 
     # 收集已完成任务的结果
     for comments, clusters in done_results:
