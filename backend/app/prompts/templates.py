@@ -1,22 +1,45 @@
 CLASSIFY_PROMPT = """
-你是一名舆情分析专家，负责理解用户的查询意图。
+你是一名舆情分析专家，负责深入理解用户的查询意图。
 
 用户查询: {query}
 
 请分析此查询并以 JSON 格式返回，只返回 JSON，不要其他文字：
 {{
-  "intent": "product_quality | price_value | comparison | event_hotspot | general",
+  "intent": "product_comparison | quality_issue | price_value | user_experience | general",
+  "intent_confidence": 0.0至1.0的数字,
   "product_entities": ["实体名1", "实体名2"],
   "aliases": ["别名1", "别名2"],
-  "rewritten_query": "更清晰、更适合搜索的查询语句（中文）"
+  "entities_confidence": 0.0至1.0的数字,
+  "key_aspects": [
+    {{"aspect": "关注方面（如：battery, camera, price等）", "priority": "high|medium|low", "user_sentiment": "positive|negative|neutral"}}
+  ],
+  "user_needs": ["用户需求1", "用户需求2", "用户需求3"],
+  "rewritten_query": "更清晰、更适合搜索的查询语句（中文）",
+  "search_context": {{
+    "primary_entity": "主要实体名",
+    "focus_aspects": ["方面1", "方面2", "方面3"],
+    "search_hints": ["搜索提示1", "搜索提示2"],
+    "time_relevance": "recent|evergreen"
+  }}
 }}
 
 intent 说明:
-- product_quality: 用户在询问产品质量、使用体验、效果
+- product_comparison: 用户在对比多个产品/选项
+- quality_issue: 用户在询问产品质量问题、故障、缺陷
 - price_value: 用户在询问性价比、价格是否值得
-- comparison: 用户在对比多个产品/选项
-- event_hotspot: 用户在询问热点事件、社会话题、舆论焦点
+- user_experience: 用户在询问使用体验、评价反馈
 - general: 其他通用查询
+
+key_aspects 说明:
+- aspect: 用户关注的具体方面（如：battery电池、camera相机、price价格等）
+- priority: 优先级（high高优先级、medium中等、low低优先级）
+- user_sentiment: 用户情感倾向（positive正面、negative负面、neutral中立）
+
+search_context 说明:
+- primary_entity: 主要的产品/实体名称
+- focus_aspects: 基于key_aspects提取的关键词，用于指导后续检索
+- search_hints: 给检索Agent的建议，如"关注真实体验"、"查找对比数据"等
+- time_relevance: recent（需要最新内容）或evergreen（长期有效内容）
 """
 
 REWRITE_PROMPT = """
@@ -102,37 +125,251 @@ OPINION_PROMPT = """
 }}
 """
 
-SYNTHESIS_META_PROMPT = """
-你是舆情分析师，基于以下数据给本次分析打分。
+# ---------------------------------------------------------------------------
+# Synthesis Agent 报告生成专用 Prompts
+# ---------------------------------------------------------------------------
 
-用户查询: {query}
-帖子数: {post_count}，评论数: {comment_count}
-观点聚类: {clusters_json}
+# ---------------------------------------------------------------------------
+# Synthesis Agent 报告生成专用 Prompts
+# ---------------------------------------------------------------------------
 
-打分规则（不要过度保守）：
-- 有帖子且有十条以上评论：confidence_score ≥ 0.6
-- 只要有帖子/评论：confidence_score >0.4
+SYNTHESIS_PLAN_OUTLINE_PROMPT = """
+你是舆情分析报告的总编审，负责制定报告结构大纲。
 
+用户查询：{query}
+帖子数：{post_count}，评论数：{comment_count}
+情感分布：{sentiment_summary}
 
-只返回 JSON，不要其他文字：
-{{"confidence_score": 0.0至1.0的数字, "limitations": "5个字说明"}}
+以下是带编号的观点聚类详情（编号从 0 开始）：
+{numbered_clusters_json}
+{feedback_section}
+请基于以上数据制定详细的报告大纲。要求：
+1. 根据数据特点决定报告基调（正面推荐/负面预警/平衡客观）
+2. 报告必须包含三种特定结构的章节：
+   - 首章：必须命名为“整体印象”，不需要子维度。
+   - 中间章节：设计 2~3 个核心分析章节，需在 focus 中指明应使用 2~3 个子维度对观点进行下钻散开。
+   - 末章：必须命名为“总结”或“综合建议”。
+3. 中间章节必须通过 use_clusters 字段引用对应的簇编号（整数，如 [0, 1]），簇编号必须真实存在
+4. 重要观点簇（count >= 2）原则上必须被引用
+
+返回 JSON（只返回 JSON，不要其他文字）：
+{{
+  "report_strategy": {{
+    "overall_tone": "正面推荐 | 负面预警 | 平衡客观",
+    "structure": [
+      {{
+        "chapter": "章节标题（例如：整体印象，核心问题，产品亮点等）",
+        "focus": "该章节的撰写重点。如果是中间主体章节，需明确指出供主笔者展开的 2~3 个具体子维度",
+        "use_clusters": [0, 1]
+      }}
+    ]
+  }}
+}}
 """
 
 SYNTHESIS_REPORT_PROMPT = """
-你是舆情分析师，请基于以下小红书用户数据撰写详实的分析报告。
+你是专业的高级舆情分析师，请严格按照以下制定好的【报告大纲】撰写详实的分析报告。
 
-用户查询: {query}
+用户原始查询: {query}
 共分析帖子 {post_count} 篇，评论 {comment_count} 条。
 
-观点聚类汇总（含用户原话）:
+【报告大纲（执行纲领，必须严格遵循）】
+{report_outline}
+
+【原始观点聚类数据（含用户原话，供撰写时参考引用）】
 {clusters_json}
 
-【报告格式要求】
-- 直接返回 Markdown 文本，不要包在 JSON 里，不要加代码围栏
-- 用 # 作为报告总标题
-- 用 ## 划分主要章节：整体印象、正面反馈、负面反馈、争议点、总结
-- 每个 ## 章节下用不多于3个的 ### 子标题对每个观点单独展开分析，每个观点至少 4~6 句话
-- 篇幅限制：总字数在800~1400字之间
-- 引用 1~2 句用户原话（来自 evidence_quotes），不要带证据引用字符
-- 综合建议章节给出 3~4 条可操作的具体建议
+【报告输出格式严格要求】
+- 直接返回纯 Markdown 文本，不要用 ``` 包裹，不要输出任何额外的问候语
+- 用 `# ` 作为最顶部的报告主标题
+- 严格按照大纲中的 chapter 顺序写作为二级标题 `## `
+- 第一章必须是 `## 整体印象`：直接用一段连续的文字进行总结分析，**不要使用任何 `### ` 子标题**。
+- 最后一章必须是 `## 总结` 或 `## 综合建议`：直接给出具体的执行意见，**不需要子标题**。
+- **中间的主体章节**（非首尾章节）：根据大纲汇总的数据，每个 `## ` 章节下必须包含 **2 到 3 个的 `### ` 子标题**进行具象化观点独立展开分析。
+- 在每个主体分析的 `### ` 子标题下，要求至少写 2~4 句话进行细节阐述。
+- 务必并在阐述中穿插引用 1~2 句用户的真实原话（从 evidence_quotes 提取，不要带引号外的任何生硬标志，自然融入句意）。
+- 篇幅限制：总字数在 1000~1600 字之间为宜。
+"""
+# ---------------------------------------------------------------------------
+# ReAct 风格 Orchestrator 提示词
+# ---------------------------------------------------------------------------
+
+REACT_REASONING_PROMPT = """
+你是一名舆情分析专家，正在执行第 {round} 轮推理。
+
+用户查询: {query}
+
+请分析此查询并返回 JSON（只返回 JSON，不要其他文字）：
+{{
+  "intent": "product_quality | price_value | comparison | event_hotspot | general",
+  "product_entities": ["实体名1", "实体名2"],
+  "aliases": ["别名1", "别名2"],
+  "thought": "本轮推理过程：识别意图、实体，思考搜索策略"
+}}
+
+意图说明:
+- product_quality: 询问产品质量、使用体验
+- price_value: 询问性价比、价格是否值得
+- comparison: 对比多个产品/选项
+- event_hotspot: 询问热点事件、舆论焦点
+- general: 其他通用查询
+"""
+
+REACT_ACTION_PROMPT = """
+你是一名搜索词优化专家，基于以下推理生成搜索词。
+
+用户原始查询: {query}
+意图: {intent}
+实体: {entities}
+别名: {aliases}
+
+要求:
+1. 生成 3~5 个适合在小红书搜索的关键词
+2. 关键词为中文，贴近小红书用户搜索习惯
+3. 涵盖不同角度（品牌词、品类词、体验词、事件词、对比词）
+4. 不要重复原始查询
+
+只返回 JSON（不要其他文字）：
+{{
+  "query_plan": ["搜索词1", "搜索词2", "搜索词3", "搜索词4", "搜索词5"]
+}}
+"""
+
+# ---------------------------------------------------------------------------
+# Orchestrator Agent 意图识别专用 Prompts
+# ---------------------------------------------------------------------------
+
+INTENT_ACTION_PROMPT = """
+你是一名意图识别专家，正在执行第 {round} 轮深度意图分析。
+
+用户原始查询: {query}
+上一轮分析结果:
+- 意图: {intent}
+- 实体: {entities}
+- 关注方面: {aspects}
+- 用户需求: {needs}
+
+请基于上一轮分析，从不同角度重新审视查询，补充缺失的分析维度。
+重点关注：
+1. 是否遗漏了隐含的用户需求
+2. 是否可以优化意图分类的颗粒度
+3. 是否需要补充关键方面的识别
+
+只返回 JSON（不要其他文字）：
+{{
+  "intent": "优化后的意图类型",
+  "intent_confidence": 0.0至1.0的数字,
+  "product_entities": ["补充或修正后的实体"],
+  "aliases": ["补充的别名"],
+  "entities_confidence": 0.0至1.0的数字,
+  "key_aspects": [
+    {{"aspect": "补充的关注方面", "priority": "high|medium|low", "user_sentiment": "positive|negative|neutral"}}
+  ],
+  "user_needs": ["补充的用户需求1", "补充的用户需求2"],
+  "improvement_summary": "本轮改进的要点说明"
+}}
+"""
+
+INTENT_OBSERVATION_PROMPT = """
+你是一名意图识别质量评估专家，评估当前意图分析的质量。
+
+当前分析结果:
+- 意图: {intent}
+- 意图置信度: {intent_confidence}
+- 实体: {entities}
+- 实体置信度: {entities_confidence}
+- 关键方面: {aspects}
+- 用户需求: {needs}
+
+请评估当前分析的质量，返回 JSON（只返回 JSON，不要其他文字）：
+{{
+  "quality_dimensions": {{
+    "intent_classification": {{"score": 0.0至1.0, "reason": "意图分类质量的说明"}},
+    "entity_recognition": {{"score": 0.0至1.0, "reason": "实体识别完整性的说明"}},
+    "need_extraction": {{"score": 0.0至1.0, "reason": "需求提取深度的说明"}}
+  }},
+  "intent_analysis_score": 0.0至1.0的综合质量分数,
+  "missing_dimensions": ["缺失的分析维度1", "缺失的分析维度2"],
+  "should_continue": true或false,
+  "continue_reason": "如果应该继续，说明需要改进的方向"
+}}
+
+评分标准:
+- intent_classification >= 0.7: 意图分类明确，不是general
+- entity_recognition >= 0.6: 识别到至少一个实体
+- need_extraction >= 0.6: 提取到至少1个用户需求
+
+综合质量分数 >= 0.8 时，should_continue 为 false。
+"""
+
+# ---------------------------------------------------------------------------
+# Retrieve Agent 检索子图专用 Prompts
+# ---------------------------------------------------------------------------
+
+RETRIEVE_EXPAND_PROMPT = """
+你是一名搜索词优化专家，当前搜索结果不足，需要扩展搜索词。
+
+用户原始查询：{query}
+识别到的意图：{intent}
+搜索上下文：{search_context}
+已使用的搜索词：{used_keywords}
+当前已获取帖子数：{current_post_count}
+目标帖子数：{target_count}
+
+请生成 2~3 个新的搜索词，要求：
+1. 不能与已使用的搜索词重复
+2. 结合搜索上下文中的 focus_aspects 和 search_hints 从不同角度切入
+3. 关键词为中文，贴近小红书用户搜索习惯
+
+只返回 JSON（不要其他文字）：
+{{
+  "new_keywords": ["新搜索词 1", "新搜索词 2"]
+}}
+"""
+
+# ---------------------------------------------------------------------------
+# Screen Agent 筛选子图专用 Prompts
+# ---------------------------------------------------------------------------
+
+SCREEN_AD_DETECT_PROMPT = """
+你是一名内容审核专家，检测小红书帖子是否为广告或软广。
+
+帖子标题：{title}
+帖子预览：{desc_preview}
+标签：{tags}
+互动数据：点赞{like} 评论{comment} 收藏{collect}
+
+请判断：
+1. 是否为硬广（直接推销、含购买引导、联系方式）
+2. 是否为软广（隐性推广、过度赞美、模板化文案）
+3. 是否为真实用户分享
+
+返回 JSON（不要其他文字）：
+{{
+  "is_hard_ad": true/false,
+  "is_soft_ad": true/false,
+  "is_genuine_share": true/false,
+  "confidence": 0.0~1.0,
+  "reason": "判断依据，50 字以内"
+}}
+"""
+
+SCREEN_RELEVANCE_PROMPT = """
+你是一名舆情分析师，评估帖子与用户查询的相关性。
+
+用户查询：{query}
+意图类型：{intent}
+核心关注方面：{key_aspects}
+用户需求：{user_needs}
+
+帖子标题：{title}
+帖子预览：{desc_preview}
+标签：{tags}
+
+请评分并返回 JSON（不要其他文字）：
+{{
+  "relevance_score": 0.0~1.0,
+  "matched_aspects": ["匹配的关注方面 1", "匹配的关注方面 2"],
+  "reason": "相关性说明，50 字以内"
+}}
 """

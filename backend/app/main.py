@@ -17,13 +17,21 @@ from loguru import logger
 
 load_dotenv()
 
-if not os.getenv("QIANFAN_BEARER_TOKEN"):
-    logger.warning("未配置 QIANFAN_BEARER_TOKEN，大模型分析调用将不可用")
-
-logger.info(
-    "当前 LLM Provider=Qianfan, model={} ",
-    os.getenv("QIANFAN_MODEL") or "qwen3-14b",
-)
+provider = os.getenv("LLM_PROVIDER", "qianfan").strip().lower()
+if provider == "longcat":
+    if not os.getenv("LONGCAT_API_KEY"):
+        logger.warning("未配置 LONGCAT_API_KEY，大模型分析调用将不可用")
+    logger.info(
+        "当前 LLM Provider=Longcat, model={}",
+        os.getenv("LONGCAT_MODEL") or "deepseek-chat",
+    )
+else:
+    if not os.getenv("QIANFAN_BEARER_TOKEN"):
+        logger.warning("未配置 QIANFAN_BEARER_TOKEN，大模型分析调用将不可用")
+    logger.info(
+        "当前 LLM Provider=Qianfan, model={}",
+        os.getenv("QIANFAN_MODEL") or "ernie-4.5-21b-a3b",
+    )
 
 from app.api.v1.routes_analysis import router as analysis_router
 

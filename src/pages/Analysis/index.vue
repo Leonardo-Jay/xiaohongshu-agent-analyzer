@@ -48,68 +48,99 @@
 
       <div v-if="loading || stages.length > 0" class="progress-area">
         <div class="progress-inner">
-          <div v-for="s in stages" :key="s.stage" class="stage-item">
-            <el-icon v-if="s.done" color="#10B981"><CircleCheckFilled /></el-icon>
-            <el-icon v-else-if="s.error" color="#EF4444"><CircleCloseFilled /></el-icon>
-            <el-icon v-else class="is-loading" color="#1E3A8A"><Loading /></el-icon>
-            <span class="stage-msg">{{ s.message }}</span>
-            <el-progress
-              v-if="!s.done && s.stage === 'analyze'"
-              :percentage="analyzeProgress"
-              :striped="true"
-              :striped-flow="true"
-              :duration="8"
-              style="width:120px;flex-shrink:0"
-              :show-text="false"
-            />
-          </div>
-        </div>
-        <div v-if="postReadingList.length > 0" class="post-reading-box">
-          <div v-for="(item, i) in postReadingList" :key="i" class="post-reading-item">{{ item }}</div>
+          <template v-for="s in stages" :key="s.stage">
+            <div class="stage-item">
+              <el-icon v-if="s.done" color="#10B981"><CircleCheckFilled /></el-icon>
+              <el-icon v-else-if="s.error" color="#EF4444"><CircleCloseFilled /></el-icon>
+              <el-icon v-else class="is-loading" color="#1E3A8A"><Loading /></el-icon>
+              <span class="stage-msg">{{ s.message }}</span>
+              <el-progress
+                v-if="!s.done && s.stage === 'analyze'"
+                :percentage="analyzeProgress"
+                :striped="true"
+                :striped-flow="true"
+                :duration="8"
+                style="width:120px;flex-shrink:0"
+                :show-text="false"
+              />
+            </div>
+
+            <!-- 将读取框当做 retrieve 阶段的子消息条，锁定在原本位置 -->
+            <div v-if="s.stage === 'retrieve' && postReadingList.length > 0"
+                 class="post-reading-box"
+                 :class="{ 'is-collapsed': isReportGenerating && !isPostReadingExpanded }"
+                 @click="togglePostReading">
+              <div v-if="isReportGenerating && !isPostReadingExpanded" class="post-reading-summary">
+                已读取 {{ postReadingList.length }} 篇帖子详细内容 ↓
+              </div>
+              <div v-else class="post-reading-content">
+                <div v-for="(item, i) in postReadingList" :key="i" class="post-reading-item">{{ item }}</div>
+                <div v-if="isReportGenerating" class="collapse-btn" @click.stop="isPostReadingExpanded = false">收起详细记录</div>
+              </div>
+            </div>
+          </template>
         </div>
       </div>
 
-      <div v-if="reportBuffer || result" class="result-wrap">
-        <div class="result-meta">
-          <div class="meta-tags">
-            <el-tag type="success">置信度 {{ ((result?.confidence_score || 0) * 100).toFixed(0) }}%</el-tag>
-            <el-tag style="margin-left:8px">分析帖子 {{ result?.screened_count ?? '—' }} 篇</el-tag>
-            <el-tag style="margin-left:8px">分析评论 {{ result?.comment_count ?? '—' }} 条</el-tag>
+      <div v-if="reportBuffer || result" class="dashboard-layout">
+        <!-- 主报告区 -->
+        <div class="result-wrap">
+          <div class="result-meta">
+            <div class="meta-tags">
+              <el-tag type="success">置信度 {{ ((result?.confidence_score || 0) * 100).toFixed(0) }}%</el-tag>
+              <el-tag style="margin-left:8px">分析帖子 {{ result?.screened_count ?? '—' }} 篇</el-tag>
+              <el-tag style="margin-left:8px">分析评论 {{ result?.comment_count ?? '—' }} 条</el-tag>
+            </div>
+            <div class="meta-actions">
+              <el-button size="small" @click="copyMarkdown">复制 Markdown</el-button>
+              <el-button size="small" @click="downloadWord">下载 Word</el-button>
+              <el-button size="small" @click="downloadPdf" :loading="pdfLoading">下载 PDF</el-button>
+            </div>
           </div>
-          <div class="meta-actions">
-            <el-button size="small" @click="copyMarkdown">复制 Markdown</el-button>
-            <el-button size="small" @click="downloadWord">下载 Word</el-button>
-            <el-button size="small" @click="downloadPdf" :loading="pdfLoading">下载 PDF</el-button>
+
+          <!-- 流式加载中：显示累积报告文本 -->
+          <div v-if="reportBuffer && !result" class="streaming-report">
+            <div class="section-main" v-html="renderMd(reportBuffer)" />
+            <div class="streaming-indicator">报告生成中…<span class="dot-dot-dot"><span>.</span><span>.</span><span>.</span></span></div>
           </div>
-        </div>
 
-        <!-- 流式加载中：显示累积报告文本 -->
-        <div v-if="reportBuffer && !result" class="streaming-report">
-          <div class="section-main" v-html="renderMd(reportBuffer)" />
-          <div class="streaming-indicator">报告生成中…<span class="dot-dot-dot"><span>.</span><span>.</span><span>.</span></span></div>
-        </div>
-
-        <!-- 报告完成：按章节分栏 + 引用 -->
-        <div v-else-if="result" class="report-sections">
-          <div v-for="(sec, si) in sectionRows" :key="si" class="section-row" :style="{ animationDelay: si * 0.06 + 's' }">
-            <div class="section-main" v-html="renderMd(sec.raw)" />
-            <div class="section-aside" v-if="sec.refs.length">
-              <div class="aside-header" v-if="si === 1">参考内容</div>
-              <div
-                v-for="(ref, ri) in sec.refs"
-                :key="ri"
-                class="aside-ref-row"
-                @mouseenter="showPopover(ref, $event)"
-                @mouseleave="hidePopover"
-              >
-                <el-tag :type="sentimentTag(ref.sentiment)" size="small" style="flex-shrink:0">{{ ref.sentiment }}</el-tag>
-                <a :href="ref.source_note_url" target="_blank" rel="noopener" class="aside-link">{{ truncateTitle(ref.source_title) }} ↗</a>
+          <!-- 报告完成：按章节分栏 -->
+          <div v-else-if="result" class="report-sections" @click="handleReportClick">
+            <div v-for="(sec, si) in sectionRows" :key="si" class="section-row" :style="{ animationDelay: si * 0.06 + 's' }">
+              <div class="section-main">
+                <div v-html="renderMd(sec.raw)"></div>
               </div>
             </div>
-            <div class="section-aside" v-else />
           </div>
         </div>
 
+        <!-- 侧边引用/证据区 -->
+        <div class="evidence-sidebar" v-if="result && result.references && result.references.length > 0">
+          <div class="sidebar-header">参考原文与评论</div>
+          <div class="evidence-list">
+            <a
+              v-for="(ref, ri) in result.references"
+              :key="ri"
+              class="evidence-card"
+              :href="ref.source_note_url" target="_blank" rel="noopener"
+              :id="'ref-card-' + ri"
+            >
+              <div class="evidence-card-header">
+                <span class="card-badge">{{ ri + 1 }}</span>
+                <div class="evidence-topic">{{ ref.topic }}</div>
+              </div>
+              <div class="evidence-meta">
+                <el-tag :type="sentimentTag(ref.sentiment)" size="small">{{ ref.sentiment }}</el-tag>
+                <span class="evidence-source">{{ truncateTitle(ref.source_title) }}</span>
+              </div>
+              <div class="evidence-quotes" v-if="ref.quotes?.length || ref.evidence_quotes?.length">
+                <div v-for="(q, qi) in (ref.quotes || ref.evidence_quotes || []).slice(0, 2)" :key="qi" class="evidence-quote-item">
+                  "{{ q }}"
+                </div>
+              </div>
+            </a>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -132,23 +163,6 @@
         <el-button type="primary" @click="saveCookie">保存</el-button>
       </template>
     </el-dialog>
-
-    <Teleport to="body">
-      <div
-        v-if="popover.visible"
-        class="popover-card"
-        :style="{ top: popover.top + 'px', left: popover.left + 'px' }"
-      >
-        <div class="popover-topic">{{ popover.data.topic }}</div>
-        <el-tag :type="sentimentTag(popover.data.sentiment)" size="small" style="margin-bottom:8px">{{ popover.data.sentiment }}</el-tag>
-        <p
-          v-for="(q, qi) in (popover.data.quotes || popover.data.evidence_quotes || []).slice(0, 3)"
-          :key="qi"
-          class="popover-quote"
-        >{{ q }}</p>
-        <div v-if="!(popover.data.quotes?.length || popover.data.evidence_quotes?.length)" class="popover-empty">暂无评论引用</div>
-      </div>
-    </Teleport>
   </div>
 </template>
 
@@ -164,6 +178,15 @@ const stages = ref([])
 const result = ref(null)
 const reportBuffer = ref('')
 let hasScrolledToReport = false
+
+const isPostReadingExpanded = ref(false)
+const isReportGenerating = computed(() => !!reportBuffer.value || !!result.value)
+
+function togglePostReading() {
+  if (isReportGenerating.value) {
+    isPostReadingExpanded.value = !isPostReadingExpanded.value
+  }
+}
 
 // 报告生成后自动滚动到结果区域（预留顶部空间避免被导航栏遮挡）
 watch(result, async (val) => {
@@ -200,8 +223,6 @@ watch(postReadingList, async () => {
   if (box) box.scrollTop = box.scrollHeight
 }, { deep: true })
 
-const popover = reactive({ visible: false, top: 0, left: 0, data: {} })
-
 const configVisible = ref(false)
 const cookieInput = ref(localStorage.getItem('xhs_cookie') || '')
 let _cookieChecked = false
@@ -224,6 +245,7 @@ function resetToHero() {
   result.value = null
   reportBuffer.value = ''
   hasScrolledToReport = false
+  isPostReadingExpanded.value = false
   stages.value = []
   postReadingList.value = []
   _cookieChecked = false
@@ -338,8 +360,14 @@ async function startAnalysis() {
   })
 
   evtSource.addEventListener('result', (e) => {
-    result.value = JSON.parse(e.data)
-    _markAllDone()
+    try {
+      result.value = JSON.parse(e.data)
+      _markAllDone()
+    } catch (err) {
+      console.error('渲染最终结果时出现异常：', err)
+      ElMessage.error('处理分析结果时出错：' + err.message)
+      stopAnalysis()
+    }
   })
 
   evtSource.addEventListener('error', (e) => {
@@ -396,74 +424,129 @@ function parseSections(markdown) {
       cur.raw += line + '\n'
     } else {
       if (!sections.length) sections.push({ title: '', level: 0, body: line + '\n', raw: line + '\n' })
-      else sections[0].body += line + '\n'
+      else {
+        sections[0].body += line + '\n'
+        sections[0].raw += line + '\n'
+      }
     }
   }
   if (cur) sections.push(cur)
+
+  // 挂载引用序号角标
+  const refs = result.value?.references || []
+  if (refs.length > 0) {
+    sections.forEach(sec => {
+      const matchIndexes = new Set()
+      const searchTarget = (sec.raw || '').toLowerCase()
+
+      refs.forEach((ref, ri) => {
+        let matched = false;
+
+        // 1. Theme/Topic segment matching
+        if (ref.topic) {
+          const topicStr = ref.topic.replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '')
+          if (topicStr.length > 0) {
+            let words = []
+            if (window.Intl && Intl.Segmenter) {
+              const segmenter = new Intl.Segmenter('zh', { granularity: 'word' })
+              words = Array.from(segmenter.segment(topicStr)).filter(s => s.isWordLike).map(s => s.segment)
+            } else {
+              // Fallback: 2-char sliding window
+              for (let i = 0; i < topicStr.length - 1; i++) {
+                words.push(topicStr.slice(i, i + 2))
+              }
+            }
+            words = words.filter(w => w.length >= 2)
+            if (words.length > 0) {
+              let matchCount = 0
+              words.forEach(w => {
+                if (searchTarget.includes(w.toLowerCase())) matchCount++
+              })
+              // 收紧：匹配比例从 50% 提高到 75%，避免短小泛词造成大量误匹配
+              // 例如：2个词需匹配2个，3个词需匹配3个，4个词需匹配3个...
+              if (matchCount > 0 && matchCount >= Math.ceil(words.length * 0.75)) {
+                matched = true
+              }
+            } else if (topicStr.length >= 4 && searchTarget.includes(topicStr.toLowerCase())) {
+              // 补充校验：如果没有正常被分词，要求原长串至少包含4个及以上字符才算命中
+              matched = true
+            }
+          }
+        }
+
+        // 2. Quotes sliding window matching
+        if (!matched) {
+          const quotes = [...(ref.quotes || []), ...(ref.evidence_quotes || [])]
+          for (const q of quotes) {
+            const cleanQ = q.replace(/[^\u4e00-\u9fa5a-zA-Z0-9]/g, '').toLowerCase()
+
+            // 收紧：原话滑动特征窗口从 5 提高到 8 个连续字符相连，拦截日常用语的雷同
+            const WINDOW_SIZE = 8;
+
+            if (cleanQ.length < WINDOW_SIZE) {
+              // 如果原话本身就偏短，必须整句出现，且至少有 4 个字符以防误杀
+              if (cleanQ.length >= 4 && searchTarget.includes(cleanQ)) {
+                matched = true; break;
+              }
+            } else {
+              // 8-char sliding window
+              for (let i = 0; i <= cleanQ.length - WINDOW_SIZE; i++) {
+                if (searchTarget.includes(cleanQ.slice(i, i + WINDOW_SIZE))) {
+                  matched = true; break;
+                }
+              }
+            }
+            if (matched) break;
+          }
+        }
+
+        if (matched) {
+          matchIndexes.add(ri)
+        }
+      })
+
+      if (matchIndexes.size > 0) {
+        let badgesHtml = '<span class="inline-citations-wrap">'
+        Array.from(matchIndexes).sort((a,b)=>a-b).forEach(ri => {
+          badgesHtml += `<span class="inline-citation" data-ref-index="${ri}">${ri + 1}</span>`
+        })
+        badgesHtml += '</span>'
+        sec.raw = sec.raw.trimEnd() + '&nbsp;' + badgesHtml + '\n\n'
+      }
+    })
+  }
+
   return sections
-}
-
-const EXCLUDE_PATTERN = /结论|总结|综述|概述|局限|说明|注意/
-
-// 计算每个 ref 与某个 section 的匹配分数（命中词数），同时用 topic 和 source_title 提词
-function matchScore(ref, sec) {
-  const haystack = (sec.title + ' ' + sec.body).toLowerCase()
-  const text = ((ref.topic || '') + ' ' + (ref.source_title || '')).toLowerCase()
-  const words = [...new Set(text.split(/[\s，。、！？,.!?]+/).filter(w => w.length >= 2))]
-  return words.filter(w => haystack.includes(w)).length
 }
 
 const sectionRows = computed(() => {
   if (!result.value) return []
-  const refs = result.value.references || []
-  const sections = parseSections(result.value.final_answer || '')
-
-  // 每个 ref 全局只分配一次，分配给分数最高的 section（去重）
-  const refKey = r => (r.source_note_url || '') + '||' + (r.topic || '')
-  const refBestSection = new Map() // key -> { sectionIdx, score }
-
-  sections.forEach((sec, si) => {
-    if (EXCLUDE_PATTERN.test(sec.title)) return
-    if (sec.level <= 1) return  // 排除报告总标题（level 0/1）
-    refs.forEach(r => {
-      if (!r.source_note_url) return
-      const score = matchScore(r, sec)
-      if (score === 0) return
-      const key = refKey(r)
-      const prev = refBestSection.get(key)
-      if (!prev || score > prev.score) {
-        refBestSection.set(key, { sectionIdx: si, score })
-      }
-    })
-  })
-
-  const sectionRefs = sections.map(() => [])
-  refBestSection.forEach(({ sectionIdx }, key) => {
-    const ref = refs.find(r => refKey(r) === key)
-    if (ref) sectionRefs[sectionIdx].push(ref)
-  })
-
-  return sections.map((sec, si) => ({ ...sec, refs: (sectionRefs[si] || []).slice(0, 4) }))
+  return parseSections(result.value.final_answer || '')
 })
 
-function showPopover(ref, event) {
-  const rect = event.currentTarget.getBoundingClientRect()
-  popover.data = ref
-  
-  // 原来的 top 是 rect.top，改动后：
-  // rect.top 是链接顶部，popover 本身高度假设是 200px
-  // 减去一定像素使其显示在上方。
-  // 注意：如果你的 popover 组件有固定高度，建议 top = rect.top - 浮窗高度 - 间距
-  popover.top = rect.top - 100; // 修改这里，让浮窗上移 180 像素（根据你的实际浮窗高度调整）
-  
-  // 保持在原处或居中对齐链接
-  popover.left = rect.left;
-  
-  popover.visible = true
-}
+function handleReportClick(e) {
+  const target = e.target.closest('.inline-citation')
+  if (!target) return
+  const idx = parseInt(target.getAttribute('data-ref-index'), 10)
+  const sidebar = document.querySelector('.evidence-sidebar')
+  const card = document.getElementById('ref-card-' + idx)
+  if (sidebar && card) {
+    // 采用更可靠的原生 scrollIntoView，居中对齐能避免被上方吸顶表头遮挡，也不受边距乱算影响
+    card.scrollIntoView({
+      behavior: 'smooth',
+      block: 'center'
+    })
 
-function hidePopover() {
-  popover.visible = false
+    // 重置并触发高亮动画
+    card.classList.remove('flash-highlight')
+    void card.offsetWidth // force reflow
+    card.classList.add('flash-highlight')
+
+    // 延迟 3 秒后移除动画类
+    setTimeout(() => {
+      if (card) card.classList.remove('flash-highlight')
+    }, 3000)
+  }
 }
 
 function truncateTitle(title) {
@@ -473,6 +556,13 @@ function truncateTitle(title) {
 
 function sentimentTag(s) {
   return s === '正面' ? 'success' : s === '负面' ? 'danger' : 'info'
+}
+
+function sentimentClass(s) {
+  if (s === '正面') return 'dot-success';
+  if (s === '负面') return 'dot-danger';
+  if (s === '中立') return 'dot-info';
+  return 'dot-default';
 }
 
 const pdfLoading = ref(false)
@@ -692,10 +782,19 @@ async function downloadWord() {
   color: #374151;
 }
 
-/* ── Result card ── */
-.result-wrap {
-  max-width: 900px;
+/* ── Dashboard Layout & Sidebar ── */
+.dashboard-layout {
+  max-width: 1200px;
   margin: 24px auto;
+  display: flex;
+  gap: 20px;
+  align-items: flex-start;
+  padding: 0 20px;
+}
+.result-wrap {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
   background: rgba(255,255,255,0.85);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
@@ -704,6 +803,125 @@ async function downloadWord() {
   box-shadow: 0 4px 32px rgba(30,58,138,0.08);
   padding: 0 0 24px;
   overflow: hidden;
+}
+
+.evidence-sidebar {
+  width: 340px;
+  flex-shrink: 0;
+  position: sticky;
+  top: 80px;
+  background: rgba(248, 250, 252, 0.85);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(226, 232, 240, 0.8);
+  border-radius: 16px;
+  max-height: calc(100vh - 100px);
+  overflow-y: auto;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.04);
+  padding: 0;
+  /* 自定义滚动条更美观 */
+  scrollbar-width: thin;
+  scrollbar-color: #cbd5e1 transparent;
+}
+.evidence-sidebar::-webkit-scrollbar {
+  width: 6px;
+}
+.evidence-sidebar::-webkit-scrollbar-thumb {
+  background-color: #cbd5e1;
+  border-radius: 3px;
+}
+.sidebar-header {
+  font-size: 15px;
+  font-weight: 700;
+  color: #334155;
+  margin: 0;
+  text-align: center;
+  padding: 16px 16px 12px 16px;
+  border-bottom: 1px solid #e2e8f0;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: rgba(248, 250, 252, 0.95);
+  backdrop-filter: blur(8px);
+  border-top-left-radius: 16px;
+  border-top-right-radius: 16px;
+}
+.evidence-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+}
+.evidence-card {
+  display: block;
+  text-decoration: none;
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  padding: 12px;
+  transition: all 0.3s ease;
+}
+.evidence-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.05);
+  border-color: #cbd5e1;
+}
+.evidence-card-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.card-badge {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #EFF6FF;
+  border: 1px solid #BFDBFE;
+  color: #2563EB;
+  font-size: 12px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 1px;
+}
+.evidence-topic {
+  flex: 1;
+  font-size: 14px;
+  font-weight: 600;
+  color: #0f172a;
+  line-height: 1.4;
+}
+.evidence-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.evidence-source {
+  font-size: 12px;
+  color: #64748b;
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.evidence-quotes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.evidence-quote-item {
+  font-size: 13px;
+  color: #475569;
+  line-height: 1.5;
+  padding: 8px 10px;
+  background: #f8fafc;
+  border-radius: 6px;
+  border-left: 3px solid #cbd5e1;
+  word-break: break-all;
 }
 .result-wrap::before {
   content: '';
@@ -796,32 +1014,86 @@ async function downloadWord() {
   margin: 4px 0;
   padding-left: 20px;
 }
-.section-aside {
-  width: 220px;
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  max-height: 200px;
-  overflow-y: auto;
+/* ── Inline Citations ── */
+.section-main :deep(.inline-citations-wrap) {
+  display: inline-flex;
+  gap: 4px;
+  vertical-align: middle;
+  margin-left: 4px;
 }
-.aside-ref-row {
+.section-main :deep(.inline-citation) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #EFF6FF;
+  border: 1px solid #BFDBFE;
+  color: #2563EB;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.2s ease;
+  vertical-align: super;
+}
+.section-main :deep(.inline-citation:hover) {
+  background: #2563EB;
+  color: #FFF;
+  transform: scale(1.1);
+  box-shadow: 0 2px 6px rgba(37,99,235,0.3);
+}
+@keyframes flashBg {
+  0%   { box-shadow: 0 0 0 0 rgba(37,99,235,0.5); border-color: #3B82F6; background: #EFF6FF; transform: scale(1); }
+  15%  { box-shadow: 0 0 0 8px rgba(37,99,235,0.2); border-color: #2563EB; background: #DBEAFE; transform: scale(1.02); }
+  30%  { box-shadow: 0 0 0 4px rgba(37,99,235,0.1); border-color: #3B82F6; background: #EFF6FF; transform: scale(1); }
+  100% { box-shadow: 0 0 0 0 rgba(37,99,235,0); border-color: #e2e8f0; background: #ffffff; transform: scale(1); }
+}
+.flash-highlight {
+  animation: flashBg 3s ease-out;
+}
+/* --- Source Chips 胶囊样式 --- */
+.source-chips-container {
   display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+  margin-bottom: 24px;
+}
+.source-chip {
+  display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 13px;
-}
-.aside-link {
-  color: #1E3A8A;
+  padding: 4px 12px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 20px;
   text-decoration: none;
+  transition: all 0.2s ease;
+}
+.source-chip:hover {
+  background: #f1f5f9;
+  border-color: #cbd5e1;
+  transform: translateY(-1px);
+}
+.chip-title {
+  font-size: 12px;
+  color: #475569;
+  max-width: 200px;
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
 }
-.aside-link:hover {
-  text-decoration: underline;
-  color: #3B82F6;
+.chip-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
 }
+.dot-success { background: #10B981; }
+.dot-danger  { background: #EF4444; }
+.dot-info    { background: #F59E0B; }
+.dot-default { background: #94A3B8; }
 .popover-card {
   position: fixed;
   z-index: 9999;
@@ -859,15 +1131,56 @@ async function downloadWord() {
 }
 .post-reading-box {
   margin-top: 8px;
-  max-height: 100px;
+  height: 110px; /* 固定高度，不会因为内容增加把下方布局往下顶 */
   overflow-y: auto;
   background: rgba(239,246,255,0.8);
   border: 1px solid rgba(191,219,254,0.6);
-  border-radius: 8px;
-  padding: 6px 10px;
+  border-radius: 16px; /* 椭圆框 */
+  padding: 10px 20px;
   font-size: 13px;
   color: #374151;
   line-height: 1.6;
+  transition: all 0.3s ease;
+}
+.post-reading-box.is-collapsed {
+  height: 21px; /* 跟随 stage-item 类似的高度 */
+  margin-top: 0;
+  padding: 6px 14px;
+  background: rgba(255,255,255,0.8);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid rgba(255,255,255,0.6);
+  box-shadow: 0 2px 12px rgba(0,0,0,0.05);
+  border-radius: 10px;
+  overflow: hidden;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.post-reading-box.is-collapsed:hover {
+  background: rgba(243, 244, 246, 0.8);
+}
+.post-reading-summary {
+  color: #6B7280;
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.5px;
+}
+.post-reading-content {
+  display: flex;
+  flex-direction: column;
+}
+.collapse-btn {
+  margin-top: 8px;
+  text-align: center;
+  color: #2563EB;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 4px 0;
+}
+.collapse-btn:hover {
+  text-decoration: underline;
 }
 .post-reading-item:last-child {
   color: #1E3A8A;

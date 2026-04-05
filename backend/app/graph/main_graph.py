@@ -1,28 +1,32 @@
-"""LangGraph 主图 — 14 个节点 + 条件边。
+"""LangGraph 主图 — 固定外层流水线的结构镜像。
 
 主路径:
   ingest_request
-  → classify_intent
-  → rewrite_and_plan
-  → retrieve_memory_context
-  → tool_route_search
-  → evaluate_retrieval_coverage ──(不足且attempts<2)──→ expand_queries_fallback → tool_route_search
-                                ──(足够 or 达最大)──→ content_review_filter
-  → content_review_filter ──(无内容)──→ stream_output
-                          ──(有内容)──→ fetch_comments_batch
-  → dedupe_and_cluster → opinion_analysis → synthesize_answer → store_memory → stream_output → END
+  → orchestrator (意图识别 ReAct 子图)
+  → retrieve (检索 ReAct 子图)
+  → screen (筛选子图：pre_filter → detect_ads → rank_and_select)
+  → analyze (评论分析子图：select_posts → fetch_comments → check_quality)
+  → synthesize_answer → store_memory → stream_output → END
 
-注意：含 MCP client 的节点（tool_route_search、fetch_comments_batch）
-在 workflow.py 中直接调用 Agent 函数；main_graph 中同名节点为可覆盖的占位。
-workflow.py 作为实际运行入口，main_graph 用于图结构可视化与导出。
+注意：
+- `workflow.py` 是实际运行入口
+- `main_graph.py` 仅用于表达运行时架构与图结构导出
+- orchestrator 是意图识别子图，负责理解任务并输出高质量的意图分析结果
+- retrieve 是检索子图，负责基于 orchestrator 的 search_context 进行检索，直到帖子数量>=10 篇
+- screen 是筛选子图，负责过滤广告/软广并基于相关性排序输出 8~10 篇帖子
+- analyze 是评论分析子图，负责爬取评论、过滤无效内容、观点聚类、情感分析
 """
 from __future__ import annotations
 
 import uuid
-from typing import Any, Literal
+from typing import Any
 
 from langgraph.graph import StateGraph, END
-
+from app.agents.analyze_agent import build_analyze_graph
+from app.agents.synthesis_agent import build_synthesis_graph
+from app.agents.orchestrator_agent import build_orchestrator_graph
+from app.agents.retrieve_agent import build_retrieve_graph
+from app.agents.screen_agent import build_screen_graph
 from app.models.schemas import GraphState
 
 
@@ -33,10 +37,25 @@ from app.models.schemas import GraphState
 
 def ingest_request(state: GraphState) -> dict[str, Any]:
     """解析入参，初始化 state。"""
+    query = state.get("user_query_raw", "")
     return {
         "request_id": state.get("request_id") or str(uuid.uuid4()),
+        "user_query_rewritten": query,
+        "intent": "general",
+        "intent_confidence": 0.0,
+        "product_entities": [],
+        "aliases": [],
+        "entities_confidence": 0.0,
+        "key_aspects": [],
+        "user_needs": [],
+        "search_context": {},
+        "intent_analysis_score": 0.0,
+        "missing_dimensions": [],
+        # Retrieve 初始化
+        "query_plan": [],
         "search_attempts": 0,
         "retrieved_posts": [],
+        "retrieval_coverage_score": 0.0,
         "screened_items": [],
         "retrieved_comments": [],
         "clusters": [],
@@ -44,84 +63,23 @@ def ingest_request(state: GraphState) -> dict[str, Any]:
         "stream_events": [],
         "limitations": [],
         "memory_context": "",
+        # 初始化意图识别循环控制字段
+        "_intent_round": 0,
+        "_intent_done": False,
+        # 初始化检索循环控制字段
+        "_retrieve_round": 0,
+        "_retrieve_done": False,
+        "_current_batch": [],
+        "_used_keywords": [],
+        # 初始化分析循环控制字段
+        "_analyze_round": 0,
+        "_analyze_done": False,
+        "_posts_to_fetch": [],
+        "_fetched_comment_count": 0,
     }
 
 
-def classify_intent(state: GraphState) -> dict[str, Any]:
-    """LLM 判断意图和产品实体（由 orchestrator_agent.classify_intent 实现）。"""
-    return {
-        "intent": state.get("intent", "general"),
-        "product_entities": state.get("product_entities", []),
-        "aliases": state.get("aliases", []),
-        "user_query_rewritten": state.get("user_query_rewritten", state.get("user_query_raw", "")),
-    }
-
-
-def rewrite_and_plan(state: GraphState) -> dict[str, Any]:
-    """生成扩展搜索词列表（由 orchestrator_agent.rewrite_and_plan 实现）。"""
-    return {
-        "query_plan": state.get("query_plan") or [state.get("user_query_raw", "")],
-    }
-
-
-def retrieve_memory_context(state: GraphState) -> dict[str, Any]:
-    """查询历史记忆（早期返回空）。"""
-    return {"memory_context": ""}
-
-
-def tool_route_search(state: GraphState) -> dict[str, Any]:
-    """调用 MCP search_posts（由 retrieve_agent.retrieve_posts 实现）。"""
-    return {"retrieved_posts": state.get("retrieved_posts", [])}
-
-
-def evaluate_retrieval_coverage(state: GraphState) -> dict[str, Any]:
-    """判断数据是否足够（阈值 ≥3 条有效帖子）。"""
-    posts = state.get("retrieved_posts", [])
-    valid = [p for p in posts if int(p.get("like_count") or 0) > 0 or int(p.get("comment_count") or 0) > 0]
-    score = min(len(valid) / 3.0, 1.0)
-    return {"retrieval_coverage_score": score}
-
-
-def expand_queries_fallback(state: GraphState) -> dict[str, Any]:
-    """扩展词重搜（由 retrieve_agent.expand_queries_fallback 实现）。"""
-    attempts = state.get("search_attempts", 0) + 1
-    return {"search_attempts": attempts}
-
-
-def content_review_filter(state: GraphState) -> dict[str, Any]:
-    """广告/无关筛选（由 screen_agent.screen_posts 实现）。"""
-    posts = state.get("retrieved_posts", [])
-    screened = state.get("screened_items") or posts
-    return {
-        "screened_items": screened,
-        "screening_stats": {
-            "total": len(posts),
-            "passed": len(screened),
-            "rejected": len(posts) - len(screened),
-            "reject_reasons": [],
-        },
-    }
-
-
-def fetch_comments_batch(state: GraphState) -> dict[str, Any]:
-    """批量拉取评论（由 analyze_agent.fetch_and_analyze 实现）。"""
-    return {"retrieved_comments": state.get("retrieved_comments", [])}
-
-
-def dedupe_and_cluster(state: GraphState) -> dict[str, Any]:
-    """去重、观点聚类（由 analyze_agent.fetch_and_analyze 实现）。"""
-    return {"clusters": state.get("clusters", [])}
-
-
-def opinion_analysis(state: GraphState) -> dict[str, Any]:
-    """情感/主题分析（由 analyze_agent.fetch_and_analyze 实现）。"""
-    return {
-        "sentiment_summary": state.get("sentiment_summary", {}),
-        "evidence_ledger": state.get("evidence_ledger", []),
-    }
-
-
-def synthesize_answer(state: GraphState) -> dict[str, Any]:
+def synthesize_node(state: GraphState, config: dict) -> dict[str, Any]:
     """生成最终报告（由 synthesis_agent.synthesize 实现）。"""
     return {
         "final_answer": state.get("final_answer", ""),
@@ -139,83 +97,256 @@ def stream_output(state: GraphState) -> dict[str, Any]:
     return {}
 
 
-# ---------------------------------------------------------------------------
-# 条件边路由
-# ---------------------------------------------------------------------------
-
-def _route_coverage(
-    state: GraphState,
-) -> Literal["expand_queries_fallback", "content_review_filter"]:
-    score = state.get("retrieval_coverage_score", 0.0)
-    attempts = state.get("search_attempts", 0)
-    if score < 1.0 and attempts < 2:
-        return "expand_queries_fallback"
-    return "content_review_filter"
-
-
-def _route_after_screen(
-    state: GraphState,
-) -> Literal["fetch_comments_batch", "stream_output"]:
-    if not state.get("screened_items"):
-        return "stream_output"
-    return "fetch_comments_batch"
-
 
 # ---------------------------------------------------------------------------
-# 构建图
+# 构建主图
 # ---------------------------------------------------------------------------
 
 def build_graph() -> StateGraph:
+    synthesis_subgraph = build_synthesis_graph()
+    orchestrator_subgraph = build_orchestrator_graph()
+    retrieve_subgraph = build_retrieve_graph()
+    screen_subgraph = build_screen_graph()
+    analyze_subgraph = build_analyze_graph()
+
+    def orchestrator_input_mapper(state: GraphState) -> dict[str, Any]:
+        return {
+            "request_id": state.get("request_id"),
+            "session_id": state.get("session_id", ""),
+            "user_query_raw": state.get("user_query_raw", ""),
+            "user_query_rewritten": state.get("user_query_rewritten", state.get("user_query_raw", "")),
+            "intent": state.get("intent", "general"),
+            "intent_confidence": state.get("intent_confidence", 0.0),
+            "product_entities": state.get("product_entities", []),
+            "aliases": state.get("aliases", []),
+            "entities_confidence": state.get("entities_confidence", 0.0),
+            "key_aspects": state.get("key_aspects", []),
+            "user_needs": state.get("user_needs", []),
+            "search_context": state.get("search_context", {}),
+            "intent_analysis_score": state.get("intent_analysis_score", 0.0),
+            "missing_dimensions": state.get("missing_dimensions", []),
+            "_intent_round": state.get("_intent_round", 0),
+            "_intent_done": state.get("_intent_done", False),
+        }
+
+    def orchestrator_output_mapper(state: GraphState, subgraph_output: dict[str, Any]) -> dict[str, Any]:
+        orchestrator_owned_fields = {
+            "intent",
+            "intent_confidence",
+            "product_entities",
+            "aliases",
+            "entities_confidence",
+            "key_aspects",
+            "user_needs",
+            "user_query_rewritten",
+            "search_context",
+            "intent_analysis_score",
+            "missing_dimensions",
+            "_intent_round",
+            "_intent_done",
+        }
+        preserved_parent_fields = {
+            key: value
+            for key, value in state.items()
+            if key not in orchestrator_owned_fields and key not in subgraph_output
+        }
+        return {
+            **preserved_parent_fields,
+            **subgraph_output,
+        }
+
+    def orchestrator_node(state: GraphState, config: dict) -> dict[str, Any]:
+        """将 orchestrator 子图作为节点函数。"""
+        subgraph_input = orchestrator_input_mapper(state)
+        subgraph_output = orchestrator_subgraph.invoke(subgraph_input, config)
+        return orchestrator_output_mapper(state, subgraph_output)
+
+    def retrieve_input_mapper(state: GraphState) -> dict[str, Any]:
+        return {
+            "request_id": state.get("request_id"),
+            "user_query_raw": state.get("user_query_raw", ""),
+            "intent": state.get("intent", "general"),
+            "product_entities": state.get("product_entities", []),
+            "aliases": state.get("aliases", []),
+            "search_context": state.get("search_context", {}),
+            "query_plan": state.get("query_plan", []),
+            "search_attempts": state.get("search_attempts", 0),
+            "retrieved_posts": state.get("retrieved_posts", []),
+            "retrieval_coverage_score": state.get("retrieval_coverage_score", 0.0),
+            "_retrieve_round": state.get("_retrieve_round", 0),
+            "_retrieve_done": state.get("_retrieve_done", False),
+            "_current_batch": state.get("_current_batch", []),
+            "_used_keywords": state.get("_used_keywords", []),
+        }
+
+    def retrieve_output_mapper(state: GraphState, subgraph_output: dict[str, Any]) -> dict[str, Any]:
+        retrieve_owned_fields = {
+            "query_plan",
+            "search_attempts",
+            "retrieved_posts",
+            "retrieval_coverage_score",
+            "_retrieve_round",
+            "_retrieve_done",
+            "_current_batch",
+            "_used_keywords",
+        }
+        preserved_parent_fields = {
+            key: value
+            for key, value in state.items()
+            if key not in retrieve_owned_fields and key not in subgraph_output
+        }
+        return {
+            **preserved_parent_fields,
+            **subgraph_output,
+        }
+
+    def retrieve_node(state: GraphState, config: dict) -> dict[str, Any]:
+        """将 retrieve 子图作为节点函数。"""
+        subgraph_input = retrieve_input_mapper(state)
+        subgraph_output = retrieve_subgraph.invoke(subgraph_input, config)
+        return retrieve_output_mapper(state, subgraph_output)
+
+    def screen_input_mapper(state: GraphState) -> dict[str, Any]:
+        return {
+            "request_id": state.get("request_id"),
+            "user_query_raw": state.get("user_query_raw", ""),
+            "intent": state.get("intent", "general"),
+            "key_aspects": state.get("key_aspects", []),
+            "user_needs": state.get("user_needs", []),
+            "retrieved_posts": state.get("retrieved_posts", []),
+            "screened_items": state.get("screened_items", []),
+            "screening_stats": state.get("screening_stats", {}),
+            "_screen_round": state.get("_screen_round", 0),
+            "_screen_done": state.get("_screen_done", False),
+        }
+
+    def screen_output_mapper(state: GraphState, subgraph_output: dict[str, Any]) -> dict[str, Any]:
+        screen_owned_fields = {
+            "screened_items",
+            "screening_stats",
+            "_screen_round",
+            "_screen_done",
+        }
+        preserved_parent_fields = {
+            key: value
+            for key, value in state.items()
+            if key not in screen_owned_fields and key not in subgraph_output
+        }
+        return {
+            **preserved_parent_fields,
+            **subgraph_output,
+        }
+
+    def screen_node(state: GraphState, config: dict) -> dict[str, Any]:
+        """将 screen 子图作为节点函数。"""
+        subgraph_input = screen_input_mapper(state)
+        subgraph_output = screen_subgraph.invoke(subgraph_input, config)
+        return screen_output_mapper(state, subgraph_output)
+
+    def analyze_input_mapper(state: GraphState) -> dict[str, Any]:
+        return {
+            "request_id": state.get("request_id"),
+            "user_query_raw": state.get("user_query_raw", ""),
+            "screened_items": state.get("screened_items", []),
+            "retrieved_comments": state.get("retrieved_comments", []),
+            "clusters": state.get("clusters", []),
+            "sentiment_summary": state.get("sentiment_summary", {}),
+            "evidence_ledger": state.get("evidence_ledger", []),
+            "_analyze_round": state.get("_analyze_round", 0),
+            "_analyze_done": state.get("_analyze_done", False),
+            "_posts_to_fetch": state.get("_posts_to_fetch", []),
+            "_fetched_comment_count": state.get("_fetched_comment_count", 0),
+        }
+
+    def analyze_output_mapper(state: GraphState, subgraph_output: dict[str, Any]) -> dict[str, Any]:
+        analyze_owned_fields = {
+            "retrieved_comments",
+            "clusters",
+            "sentiment_summary",
+            "evidence_ledger",
+            "_analyze_round",
+            "_analyze_done",
+            "_posts_to_fetch",
+            "_fetched_comment_count",
+        }
+        preserved_parent_fields = {
+            key: value
+            for key, value in state.items()
+            if key not in analyze_owned_fields and key not in subgraph_output
+        }
+        return {
+            **preserved_parent_fields,
+            **subgraph_output,
+        }
+
+    def analyze_node(state: GraphState, config: dict) -> dict[str, Any]:
+        """将 analyze 子图作为节点函数。"""
+        subgraph_input = analyze_input_mapper(state)
+        subgraph_output = analyze_subgraph.invoke(subgraph_input, config)
+        return analyze_output_mapper(state, subgraph_output)
+
+    def synthesis_input_mapper(state: GraphState) -> dict[str, Any]:
+        return {
+            "request_id": state.get("request_id"),
+            "user_query_raw": state.get("user_query_raw", ""),
+            "screened_items": state.get("screened_items", []),
+            "retrieved_comments": state.get("retrieved_comments", []),
+            "clusters": state.get("clusters", []),
+            "sentiment_summary": state.get("sentiment_summary", {}),
+            "_synthesis_round": state.get("_synthesis_round", 0),
+            "_synthesis_done": state.get("_synthesis_done", False),
+            "_report_outline": state.get("_report_outline", {}),
+            "_outline_feedback": state.get("_outline_feedback", ""),
+        }
+
+    def synthesis_output_mapper(state: GraphState, subgraph_output: dict[str, Any]) -> dict[str, Any]:
+        synthesis_owned_fields = {
+            "final_answer",
+            "confidence_score",
+            "limitations",
+            "references",
+            "_synthesis_round",
+            "_synthesis_done",
+            "_report_outline",
+            "_outline_feedback",
+        }
+        preserved_parent_fields = {
+            key: value
+            for key, value in state.items()
+            if key not in synthesis_owned_fields and key not in subgraph_output
+        }
+        return {
+            **preserved_parent_fields,
+            **subgraph_output,
+        }
+
+    def synthesis_node(state: GraphState, config: dict) -> dict[str, Any]:
+        """将 synthesis 子图作为节点函数。"""
+        subgraph_input = synthesis_input_mapper(state)
+        subgraph_output = synthesis_subgraph.invoke(subgraph_input, config)
+        return synthesis_output_mapper(state, subgraph_output)
+
     g = StateGraph(GraphState)
+    g.add_node("orchestrator", orchestrator_node)
+    g.add_node("retrieve", retrieve_node)
+    g.add_node("screen", screen_node)
+    g.add_node("analyze", analyze_node)
+    g.add_node("synthesis", synthesis_node)
 
     for fn in [
         ingest_request,
-        classify_intent,
-        rewrite_and_plan,
-        retrieve_memory_context,
-        tool_route_search,
-        evaluate_retrieval_coverage,
-        expand_queries_fallback,
-        content_review_filter,
-        fetch_comments_batch,
-        dedupe_and_cluster,
-        opinion_analysis,
-        synthesize_answer,
         store_memory,
         stream_output,
     ]:
         g.add_node(fn.__name__, fn)
 
     g.set_entry_point("ingest_request")
-    g.add_edge("ingest_request", "classify_intent")
-    g.add_edge("classify_intent", "rewrite_and_plan")
-    g.add_edge("rewrite_and_plan", "retrieve_memory_context")
-    g.add_edge("retrieve_memory_context", "tool_route_search")
-    g.add_edge("tool_route_search", "evaluate_retrieval_coverage")
-
-    g.add_conditional_edges(
-        "evaluate_retrieval_coverage",
-        _route_coverage,
-        {
-            "expand_queries_fallback": "expand_queries_fallback",
-            "content_review_filter": "content_review_filter",
-        },
-    )
-    g.add_edge("expand_queries_fallback", "tool_route_search")
-
-    g.add_conditional_edges(
-        "content_review_filter",
-        _route_after_screen,
-        {
-            "fetch_comments_batch": "fetch_comments_batch",
-            "stream_output": "stream_output",
-        },
-    )
-
-    g.add_edge("fetch_comments_batch", "dedupe_and_cluster")
-    g.add_edge("dedupe_and_cluster", "opinion_analysis")
-    g.add_edge("opinion_analysis", "synthesize_answer")
-    g.add_edge("synthesize_answer", "store_memory")
+    g.add_edge("ingest_request", "orchestrator")
+    g.add_edge("orchestrator", "retrieve")
+    g.add_edge("retrieve", "screen")
+    g.add_edge("screen", "analyze")
+    g.add_edge("analyze", "synthesis")
+    g.add_edge("synthesis", "store_memory")
     g.add_edge("store_memory", "stream_output")
     g.add_edge("stream_output", END)
 
