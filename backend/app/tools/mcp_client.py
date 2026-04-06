@@ -84,13 +84,18 @@ async def _ensure_preflight() -> None:
         _preflight_done = True
 
 
+
 class XhsMcpClient:
     def __init__(self, cookie: str | None = None):
         self._session: ClientSession | None = None
         self._cm = None
         self._cookie = cookie
+        self._is_mock = (self._cookie == "-1" or os.environ.get("XHS_COOKIES") == "-1")
 
     async def __aenter__(self) -> "XhsMcpClient":
+        if self._is_mock:
+            logger.info("测试模式（Mock）：XhsMcpClient 绕过 MCP Server，启用本地伪造数据")
+            return self
         # 预检：只执行一次（并发安全）
         await _ensure_preflight()
 
@@ -146,6 +151,10 @@ class XhsMcpClient:
         sort_type: int = 0,
         note_type: int = 0,
     ) -> list[dict[str, Any]]:
+        if self._is_mock:
+            from .mock_xhs_data import generate_mock_posts
+            return generate_mock_posts(query, require_num)
+
         data = await self._call(
             "search_posts",
             {"query": query, "require_num": require_num, "sort_type": sort_type, "note_type": note_type},
@@ -153,10 +162,18 @@ class XhsMcpClient:
         return data.get("posts", [])
 
     async def fetch_post_detail(self, note_url: str) -> dict[str, Any]:
+        if self._is_mock:
+            from .mock_xhs_data import generate_mock_detail
+            return generate_mock_detail(note_url)
+
         data = await self._call("fetch_post_detail", {"note_url": note_url})
         return data.get("note", {})
 
     async def search_comments(self, note_url: str) -> list[dict[str, Any]]:
+        if self._is_mock:
+            from .mock_xhs_data import generate_mock_comments
+            return generate_mock_comments(note_url)
+
         data = await self._call("search_comments", {"note_url": note_url})
         return data.get("comments", [])
 

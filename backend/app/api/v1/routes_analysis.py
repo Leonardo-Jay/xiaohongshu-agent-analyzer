@@ -99,6 +99,8 @@ async def _run_and_cleanup(run_id: str, query: str, q: asyncio.Queue, cookie: st
                 duration_seconds=round(time.time() - _tasks[run_id].get("started_at", time.time()), 2),
             )
     except BaseException as e:
+        if isinstance(e, asyncio.CancelledError):
+            raise
         exc_repr = f"[{type(e).__name__}] {e!r}"
         logger.error(f"[Routes] 未捕获异常 run_id={run_id}: {exc_repr}")
         q.put_nowait({"event": "error", "data": {"code": "INTERNAL_ERROR", "message": exc_repr}})

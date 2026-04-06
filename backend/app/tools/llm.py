@@ -255,7 +255,118 @@ class LongcatChatAdapter:
         return text
 
 
-def create_llm(*, temperature: float = 0, model: str | None = None, **kwargs: Any) -> QianfanChatAdapter | LongcatChatAdapter:
+
+class ModelScopeChatAdapter:
+    """兼容 OpenAI 格式的 ModelScope/DeepSeek API 适配器"""
+    def __init__(
+        self,
+        *,
+        api_url: str,
+        api_key: str,
+        model: str,
+        temperature: float = 0,
+        timeout: float = 120.0,
+    ) -> None:
+        self.api_url = api_url if api_url.endswith("/chat/completions") else f"{api_url.rstrip('/')}/chat/completions"
+        self.api_key = api_key
+        self.model = model
+        self.temperature = temperature
+        self.timeout = timeout
+
+    async def ainvoke(self, prompt: str) -> LLMResponse:
+        if not self.api_key:
+            raise RuntimeError("缺少 MODELSCOPE_API_KEY，无法调用 ModelScope 模型")
+
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.temperature,
+            "max_tokens": 4096,
+        }
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+        async with httpx.AsyncClient(timeout=40.0, trust_env=False) as client:
+            resp = await client.post(self.api_url, headers=headers, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            logger.debug(f"[LLM] ModelScope ainvoke response: {json.dumps(data, ensure_ascii=False)[:300]}...")
+
+        # 如果有 reasoning_content (思维链)，我们一般不需要返回给下游的 JSON 解析器，所以直接取 content
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return LLMResponse(content=self._normalize_text(content))
+
+    @retry_llm
+    async def astream(self, prompt: str) -> AsyncIterator[str]:
+        if not self.api_key:
+            raise RuntimeError("缺少 MODELSCOPE_API_KEY，无法调用 ModelScope 模型")
+
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                payload = {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": self.temperature,
+                    "stream": True,
+                    "max_tokens": 4096,
+                }
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}",
+                }
+
+                timeout = httpx.Timeout(40.0, connect=10.0, read=40.0)
+                async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+                    async with client.stream("POST", self.api_url, headers=headers, json=payload) as resp:
+                        resp.raise_for_status()
+                        async for line in resp.aiter_lines():
+                            if not line.startswith("data:"):
+                                continue
+                            data = line[5:].strip()
+                            if data == "[DONE]":
+                                break
+                            if not data:
+                                continue
+                            try:
+                                chunk = json.loads(data)
+                                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                                # 对于深思模型，有 reasoning_content 和 content 
+                                reasoning = delta.get("reasoning_content", "")
+                                content = delta.get("content", "")
+                                if reasoning:
+                                    # 如果你想在前端流式看到思考过程，可以将 reasoning 当作文本返回给前端
+                                    # 但通常对于 Agent 只需要最终结果，我们这里暂且将思维链屏蔽或选择忽略
+                                    pass
+                                if content:
+                                    yield content
+                            except Exception as e:
+                                logger.error(f"[LLM] ModelScope 解析 SSE chunk 异常: {e}, 原始数据: {data}")
+                                continue
+                return
+
+            except Exception as e:
+                logger.warning(f"[LLM] ModelScope 流式请求尝试 {attempt+1} 失败: {str(e)}")
+                if attempt < max_retries:
+                    await asyncio.sleep(2)
+                else:
+                    logger.error(f"[LLM] ModelScope 流式重试 3 次均失败，终止。")
+                    raise e
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        text = text.strip()
+        if text.startswith("```json") and text.endswith("```"):
+            return text[7:-3].strip()
+        if text.startswith("```") and text.endswith("```"):
+            return text[3:-3].strip()
+        return text
+
+
+def create_llm(*, temperature: float = 0, model: str | None = None, **kwargs: Any) -> QianfanChatAdapter | LongcatChatAdapter | ModelScopeChatAdapter:
     """创建聊天补全适配器（根据 LLM_PROVIDER 动态分发）。"""
     provider = os.getenv("LLM_PROVIDER", "qianfan").strip().lower()
     timeout = float(kwargs.pop("timeout", 120.0))
@@ -265,6 +376,17 @@ def create_llm(*, temperature: float = 0, model: str | None = None, **kwargs: An
         api_key = (os.getenv("LONGCAT_API_KEY") or "").strip()
         model_name = model or (os.getenv("LONGCAT_MODEL") or "deepseek-chat").strip()
         return LongcatChatAdapter(
+            api_url=api_url,
+            api_key=api_key,
+            model=model_name,
+            temperature=temperature,
+            timeout=timeout,
+        )
+    elif provider == "modelscope":
+        api_url = (os.getenv("MODELSCOPE_BASE_URL") or "https://api-inference.modelscope.cn/v1").strip()
+        api_key = (os.getenv("MODELSCOPE_API_KEY") or "").strip()
+        model_name = model or (os.getenv("MODELSCOPE_MODEL") or "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B").strip()
+        return ModelScopeChatAdapter(
             api_url=api_url,
             api_key=api_key,
             model=model_name,

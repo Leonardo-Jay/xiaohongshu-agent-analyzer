@@ -200,7 +200,7 @@ async def node_detect_ads(state: GraphState) -> dict[str, Any]:
         prompt = SCREEN_AD_DETECT_PROMPT.format(
             title=compressed.get("title", ""),
             desc_preview=compressed.get("desc_preview", ""),
-            tags="、".join(compressed.get("tags", [])),
+            tags="、".join([t.get("name", "") if isinstance(t, dict) else str(t) for t in compressed.get("tags", [])]),
             like=compressed.get("engagement", {}).get("like", 0),
             comment=compressed.get("engagement", {}).get("comment", 0),
             collect=compressed.get("engagement", {}).get("collect", 0),
@@ -306,7 +306,7 @@ async def node_rank_and_select(state: GraphState) -> dict[str, Any]:
             user_needs=needs_str,
             title=compressed.get("title", ""),
             desc_preview=compressed.get("desc_preview", ""),
-            tags="、".join(compressed.get("tags", [])),
+            tags="、".join([t.get("name", "") if isinstance(t, dict) else str(t) for t in compressed.get("tags", [])]),
         )
 
         try:

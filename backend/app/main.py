@@ -25,6 +25,13 @@ if provider == "longcat":
         "当前 LLM Provider=Longcat, model={}",
         os.getenv("LONGCAT_MODEL") or "deepseek-chat",
     )
+elif provider == "modelscope":
+    if not os.getenv("MODELSCOPE_API_KEY"):
+        logger.warning("未配置 MODELSCOPE_API_KEY，大模型分析调用将不可用")
+    logger.info(
+        "当前 LLM Provider=ModelScope, model={}",
+        os.getenv("MODELSCOPE_MODEL") or "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
+    )
 else:
     if not os.getenv("QIANFAN_BEARER_TOKEN"):
         logger.warning("未配置 QIANFAN_BEARER_TOKEN，大模型分析调用将不可用")

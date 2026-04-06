@@ -196,6 +196,8 @@ async def run_analysis(query: str, run_id: str, queue: asyncio.Queue, cookie: st
         )
 
     except BaseException as e:
+        if isinstance(e, asyncio.CancelledError):
+            raise
         exc_type = type(e).__name__
         exc_msg = repr(e)
         if "COOKIE_EXPIRED" in str(e):

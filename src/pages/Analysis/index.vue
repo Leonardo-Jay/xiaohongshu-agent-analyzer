@@ -290,6 +290,8 @@ async function cancelAnalysis() {
   if (_currentRunId) {
     try { await fetch(`/api/v1/analysis/cancel/${_currentRunId}`, { method: 'DELETE' }) } catch {}
   }
+  _upsertStage('cancel', '分析任务已取消，可点击重新分析再次执行', 0)
+  stages.value = stages.value.map(s => ({ ...s, done: false, error: s.stage === 'cancel' }))
   stopAnalysis()
 }
 
