@@ -5,7 +5,7 @@
   → orchestrator (意图识别 ReAct 子图)
   → retrieve (检索 ReAct 子图)
   → screen (筛选子图：pre_filter → detect_ads → rank_and_select)
-  → analyze (评论分析子图：select_posts → fetch_comments → check_quality)
+  → analyze (评论分析子图：select_posts → fetch_comments → cluster_opinions → check_quality)
   → synthesize_answer → store_memory → stream_output → END
 
 注意：
@@ -256,6 +256,7 @@ def build_graph() -> StateGraph:
             "_analyze_done": state.get("_analyze_done", False),
             "_posts_to_fetch": state.get("_posts_to_fetch", []),
             "_fetched_comment_count": state.get("_fetched_comment_count", 0),
+            "_raw_comments_for_clustering": state.get("_raw_comments_for_clustering", []),
         }
 
     def analyze_output_mapper(state: GraphState, subgraph_output: dict[str, Any]) -> dict[str, Any]:
@@ -268,6 +269,7 @@ def build_graph() -> StateGraph:
             "_analyze_done",
             "_posts_to_fetch",
             "_fetched_comment_count",
+            "_raw_comments_for_clustering",
         }
         preserved_parent_fields = {
             key: value

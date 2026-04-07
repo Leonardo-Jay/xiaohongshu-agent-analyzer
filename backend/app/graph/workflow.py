@@ -7,8 +7,8 @@
      - 基于 orchestrator 的 search_context 生成关键词，搜索帖子，直到数量>=10 篇
   3. screen_subgraph（内部流水线：pre_filter → detect_ads → rank_and_select）
      - 使用 orchestrator 的 key_aspects、user_needs 进行相关性筛选，过滤广告/软广
-  4. analyze_subgraph（内部流水线：select_posts → fetch_comments → check_quality）
-     - 选择 top 帖子爬取评论（40 秒超时），过滤无效评论，观点聚类，情感分析
+  4. analyze_subgraph（内部流水线：select_posts → fetch_comments → cluster_opinions → check_quality）
+     - 选择 top 帖子爬取评论（30 秒超时），过滤无效评论，然后关闭 MCP 连接进行观点聚类（90 秒）
   5. synthesize (Synthesis Agent)
 """
 from __future__ import annotations
@@ -36,7 +36,7 @@ _orchestrator_app = build_orchestrator_graph()
 _retrieve_app = build_retrieve_graph()
 # 编译 screen 子图（三阶段流水线）
 _screen_app = build_screen_graph()
-# 编译 analyze 子图（三节点 ReAct 流水线）
+# 编译 analyze 子图（四节点流水线：select_posts → fetch_comments → cluster_opinions → check_quality）
 _analyze_app = build_analyze_graph()
 # 编译 synthesis 子图（Plan and Execute）
 _synthesis_app = build_synthesis_graph()
@@ -81,6 +81,7 @@ async def run_analysis(query: str, run_id: str, queue: asyncio.Queue, cookie: st
         "clusters": [],
         "sentiment_summary": {},
         "evidence_ledger": [],
+        "_raw_comments_for_clustering": [],
         "memory_context": "",
         "confidence_score": 0.0,
         "limitations": [],
@@ -95,54 +96,67 @@ async def run_analysis(query: str, run_id: str, queue: asyncio.Queue, cookie: st
     _progress(queue, "start", "分析任务已启动...", 3)
 
     try:
-        async with XhsMcpClient(cookie=cookie) as client:
-            # ── 1. Orchestrator Subgraph (ReAct: reasoning → action → observation)
-            #     负责意图识别，输出高质量的意图分析结果
-            _progress(queue, "orchestrator", "正在分析查询意图...", 8)
-            config = {"client": client, "queue": queue}
-            orchestrator_output = await _orchestrator_app.ainvoke(state, config=config)
-            state = {**state, **orchestrator_output}
-            logger.info(
-                f"[Workflow][Orchestrator] finished: intent={state.get('intent')}, "
-                f"confidence={state.get('intent_confidence', 0.0):.2f}, "
-                f"score={state.get('intent_analysis_score', 0.0):.2f}"
-            )
-            _progress(
-                queue,
-                "orchestrator",
-                f"意图: {state.get('intent')}，实体: {state.get('product_entities')}，"
-                f"质量分数: {state.get('intent_analysis_score', 0.0):.2f}",
-                20,
-            )
+        # ── 1. Orchestrator Subgraph (ReAct: reasoning → action → observation)
+        #     负责意图识别，输出高质量的意图分析结果
+        _progress(queue, "orchestrator", "正在分析查询意图...", 8)
+        config = {"configurable": {"queue": queue}}
+        orchestrator_output = await _orchestrator_app.ainvoke(state, config=config)
+        state = {**state, **orchestrator_output}
+        logger.info(
+            f"[Workflow][Orchestrator] finished: intent={state.get('intent')}, "
+            f"confidence={state.get('intent_confidence', 0.0):.2f}, "
+            f"score={state.get('intent_analysis_score', 0.0):.2f}"
+        )
 
-            # ── 2. Retrieve Subgraph (ReAct: plan_keywords → fetch_posts → check_coverage)
-            #     接收 orchestrator 的 search_context，生成检索关键词并执行搜索
-            #     直到帖子数量 >= 10 篇或达到 3 轮上限
-            _progress(queue, "retrieve", "正在检索相关帖子...", 25)
-            config = {"configurable": {"client": client, "queue": queue}}
+        # 输出传递给 Retrieve Agent 的完整意图分析结果
+        logger.info(
+            f"[Workflow][Orchestrator] Analysis Result:\n"
+            f"  ├─ entities: {state.get('product_entities', [])}\n"
+            f"  ├─ aliases: {state.get('aliases', [])}\n"
+            f"  ├─ key_aspects: {state.get('key_aspects', [])}\n"
+            f"  ├─ user_needs: {state.get('user_needs', [])}\n"
+            f"  └─ search_context: {state.get('search_context', {})}"
+        )
+
+        _progress(
+            queue,
+            "orchestrator",
+            f"意图：{state.get('intent')}，实体：{state.get('product_entities')}，"
+            f"质量分数：{state.get('intent_analysis_score', 0.0):.2f}",
+            20,
+        )
+
+        # ── 2. Retrieve Subgraph (ReAct: plan_keywords → fetch_posts → check_coverage)
+        #     接收 orchestrator 的 search_context，生成检索关键词并执行搜索
+        #     直到帖子数量 >= 10 篇或达到 3 轮上限
+        #     使用连接池并发搜索（MCP_POOL_SIZE=2），完成后关闭池
+        _progress(queue, "retrieve", "正在并发检索相关帖子...", 25)
+        retrieve_pool_size = int(os.getenv("MCP_POOL_SIZE", "2"))
+        async with XhsMcpClientPool(size=retrieve_pool_size, cookie=cookie) as retrieve_pool:
+            config = {"configurable": {"pool": retrieve_pool, "queue": queue}}
             retrieve_output = await _retrieve_app.ainvoke(state, config=config)
-            state = {**state, **retrieve_output}
-            logger.info(
-                f"[Workflow][Retrieve] finished: posts={len(state.get('retrieved_posts', []))}, "
-                f"attempts={state.get('search_attempts', 0)}, "
-                f"coverage={state.get('retrieval_coverage_score', 0.0):.2f}"
-            )
-            _progress(queue, "retrieve", f"检索到 {len(state.get('retrieved_posts', []))} 篇帖子", 30)
+        state = {**state, **retrieve_output}
+        logger.info(
+            f"[Workflow][Retrieve] finished: posts={len(state.get('retrieved_posts', []))}, "
+            f"attempts={state.get('search_attempts', 0)}, "
+            f"coverage={state.get('retrieval_coverage_score', 0.0):.2f}"
+        )
+        _progress(queue, "retrieve", f"检索到 {len(state.get('retrieved_posts', []))} 篇帖子", 30)
 
-            # ── 3. Screen Subgraph (流水线：pre_filter → detect_ads → rank_and_select)
-            #     使用 orchestrator 的 key_aspects、user_needs 进行相关性筛选，过滤广告/软广
-            #     输出 8~10 篇最相关的帖子
-            _progress(queue, "screen", "正在筛选相关帖子（过滤广告/软广）...", 35)
-            screen_output = await _screen_app.ainvoke(state)
-            state = {**state, **screen_output}
+        # ── 3. Screen Subgraph (流水线：pre_filter → detect_ads → rank_and_select)
+        #     使用 orchestrator 的 key_aspects、user_needs 进行相关性筛选，过滤广告/软广
+        #     输出 8~10 篇最相关的帖子
+        _progress(queue, "screen", "正在筛选相关帖子（过滤广告/软广）...", 35)
+        screen_output = await _screen_app.ainvoke(state)
+        state = {**state, **screen_output}
 
-            screened = state.get("screened_items", [])
-            if not screened:
-                raise RuntimeError("筛选后无相关帖子，请尝试更换关键词")
-            _progress(queue, "screen", f"筛选出 {len(screened)} 篇相关帖子", 38)
+        screened = state.get("screened_items", [])
+        if not screened:
+            raise RuntimeError("筛选后无相关帖子，请尝试更换关键词")
+        _progress(queue, "screen", f"筛选出 {len(screened)} 篇相关帖子", 38)
 
-        # ── 4. Analyze（连接池并发：只启动3个 MCP 子进程，所有帖子共享）
-        _progress(queue, "analyze", "正在并发获取评论并分析舆情（最长约1分钟）...", 56)
+        # ── 4. Analyze（连接池并发：只启动 3 个 MCP 子进程，所有帖子共享）
+        _progress(queue, "analyze", "正在并发获取评论并分析舆情（最长约 1 分钟）...", 56)
         pool_size = int(os.getenv("MCP_POOL_SIZE", "2"))
         pool_size = max(1, min(pool_size, len(state.get("screened_items", [])) or 1))
         async with XhsMcpClientPool(size=pool_size, cookie=cookie) as pool:
@@ -158,7 +172,7 @@ async def run_analysis(query: str, run_id: str, queue: asyncio.Queue, cookie: st
         _progress(queue, "synthesize", "正在制定报告大纲与生成分析报告...", 82)
         config = {"configurable": {"queue": queue}}
         synthesis_output = await _synthesis_app.ainvoke(state, config=config)
-        
+
         # 防御性确保合并数据字典不出错
         for k, v in synthesis_output.items():
             state[k] = v

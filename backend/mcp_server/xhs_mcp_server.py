@@ -2,7 +2,7 @@
 # encoding: utf-8
 """
 XHS MCP Server — 4 tools:
-  search_posts, fetch_post_detail, search_comments, fetch_comment_thread
+  search_posts, fetch_post_detail, search_comments (一级评论，更快), fetch_comment_thread
 """
 
 import asyncio
@@ -107,7 +107,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="search_comments",
-            description="获取一篇笔记的所有评论，最多返回 50 条（含二级评论展开后计算）。",
+            description="获取一篇笔记的一级评论，最多返回 50 条（不包含二级评论，速度更快）。",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -223,31 +223,32 @@ async def _fetch_post_detail(args: dict) -> dict:
 
 
 async def _search_comments(args: dict) -> dict:
+    """获取一级评论，最多 50 条（不获取二级评论，速度更快）。"""
     note_url = args["note_url"]
     stop_event = threading.Event()
-    timer = threading.Timer(60, stop_event.set)
+    timer = threading.Timer(30, stop_event.set)  # 30 秒超时，因为只获取一级评论
     timer.daemon = True
     timer.start()
     try:
+        # 只获取一级评论，不获取二级评论
         success, msg, raw_comments = await asyncio.to_thread(
-            xhs.get_note_all_comment, note_url, XHS_COOKIES, XHS_PROXIES, stop_event
+            xhs.get_note_all_out_comment, note_url.split('/')[-1].split('?')[0],  # 提取 note_id
+            note_url.split('xsec_token=')[1].split('&')[0] if 'xsec_token=' in note_url else "",
+            XHS_COOKIES, XHS_PROXIES, stop_event
         )
     finally:
         timer.cancel()
-        stop_event.set()  # 确保线程不再继续
-    logger.debug(f"[search_comments] url={note_url} success={success} msg={msg} raw_count={len(raw_comments) if raw_comments else 0} raw_sample={str(raw_comments)[:300]}")
+        stop_event.set()
+    logger.debug(f"[search_comments] url={note_url} success={success} msg={msg} raw_count={len(raw_comments) if raw_comments else 0}")
     if not success:
-        raise RuntimeError(f"get_note_all_comment failed: {msg}")
+        raise RuntimeError(f"get_note_all_out_comment failed: {msg}")
 
+    # 只保留前 50 条一级评论，不展开二级评论
     flat: list[dict] = []
     for c in raw_comments:
         if len(flat) >= 50:
             break
         flat.append(_flat_comment(c, is_sub=False))
-        for sub in c.get("sub_comments", []):
-            if len(flat) >= 50:
-                break
-            flat.append(_flat_comment(sub, is_sub=True))
 
     return {"success": True, "total": len(flat), "comments": flat}
 

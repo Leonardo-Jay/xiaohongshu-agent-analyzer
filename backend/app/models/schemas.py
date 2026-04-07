@@ -83,6 +83,8 @@ class GraphState(TypedDict, total=False):
     _analyze_done: bool
     _posts_to_fetch: list[str]               # 本轮要爬取的帖子 note_id 列表
     _fetched_comment_count: int              # 已获取的评论总数
+    _raw_comments_for_clustering: list[dict[str, Any]]  # 原始评论列表（供聚类使用）
+    _need_refetch: bool  # 是否需要重新爬取评论（观点簇相关性不足）
 
     # ── 内部控制字段（synthesis 子图内部）
     _synthesis_round: int

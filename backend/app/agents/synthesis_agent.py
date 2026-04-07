@@ -16,7 +16,7 @@ from typing import Any, Literal
 from loguru import logger
 
 from app.models.schemas import GraphState
-from app.prompts.templates import SYNTHESIS_PLAN_OUTLINE_PROMPT, SYNTHESIS_REPORT_PROMPT
+from app.prompts.templates import SYNTHESIS_PLAN_OUTLINE_PROMPT, SYNTHESIS_MODIFY_OUTLINE_PROMPT, SYNTHESIS_REPORT_PROMPT
 from app.tools.llm import create_llm
 
 # 规划用严谨模型，生成报告用略带感情色彩的模型
@@ -74,21 +74,27 @@ async def node_plan_outline(state: GraphState) -> dict[str, Any]:
     # 给 cluster 加上 #0, #1 编号供大纲引用
     labeled_clusters = [{"id": i, **cl} for i, cl in enumerate(clusters)]
 
-    # 构造 Feedback 部分
-    feedback_section = ""
+    # 根据是否有反馈，选择不同的 Prompt
+    feedback = state.get("_outline_feedback", "")
     if feedback:
-        feedback_section = f"\n上一版大纲被审查打回，修改意见如下：\n{feedback}\n请根据以上修改意见重新制定大纲，修正错误。"
+        # 修改模式：传递原大纲 + 反馈 + 修改原则
+        previous_outline = state.get("_report_outline", {})
+        prompt = SYNTHESIS_MODIFY_OUTLINE_PROMPT.format(
+            previous_outline_json=json.dumps(previous_outline, ensure_ascii=False),
+            feedback=feedback
+        )
+        logger.info(f"[Synthesis][Plan] Round {round_num}: 根据反馈修改大纲...")
+    else:
+        # 初始生成模式：简洁的 Prompt
+        prompt = SYNTHESIS_PLAN_OUTLINE_PROMPT.format(
+            query=state.get("user_query_raw", ""),
+            post_count=post_count,
+            comment_count=comment_count,
+            sentiment_summary=json.dumps(sentiment_summary, ensure_ascii=False),
+            numbered_clusters_json=json.dumps(labeled_clusters, ensure_ascii=False)
+        )
+        logger.info(f"[Synthesis][Plan] Round {round_num}: 开始起草报告大纲...")
 
-    prompt = SYNTHESIS_PLAN_OUTLINE_PROMPT.format(
-        query=state.get("user_query_raw", ""),
-        post_count=post_count,
-        comment_count=comment_count,
-        sentiment_summary=json.dumps(sentiment_summary, ensure_ascii=False),
-        numbered_clusters_json=json.dumps(labeled_clusters, ensure_ascii=False),
-        feedback_section=feedback_section
-    )
-
-    logger.info(f"[Synthesis][Plan] Round {round_num}: 开始起草报告大纲...")
     try:
         resp = await _llm_plan.ainvoke(prompt)
         outline_json = _parse_json_response(resp.content)
@@ -104,7 +110,7 @@ async def node_plan_outline(state: GraphState) -> dict[str, Any]:
 
 
 async def node_observe_outline(state: GraphState) -> dict[str, Any]:
-    """Observe 节点：扮演质量稽查员检查大纲。利用纯规则引擎瞬间判定是否合格。"""
+    """Observe 节点：检查大纲质量，标记正确和错误的章节"""
     round_num = state.get("_synthesis_round", 1)
     # 如果已经达到重试上限，或者上一节点由于完全没数据主动挂旗跳过，直接放行
     if state.get("_synthesis_done", False) or round_num >= _MAX_SYNTHESIS_ROUNDS:
@@ -113,42 +119,72 @@ async def node_observe_outline(state: GraphState) -> dict[str, Any]:
 
     outline = state.get("_report_outline", {})
     clusters = state.get("clusters", [])
-    feedbacks = []
 
     structure = outline.get("report_strategy", {}).get("structure", [])
     if not structure:
-         feedbacks.append("大纲中缺少 structure 结构部分。")
+        return {"_synthesis_done": False, "_outline_feedback": "大纲中缺少 structure 结构部分。"}
+
+    # ── 标记章节状态 ──
+    chapter_issues = {}  # {章节名: [问题列表]}
+    correct_chapters = []  # 正确的章节列表
 
     # 提取所有被引用的 index
     referenced_indices = set()
-    for chap in structure:
+    for i, chap in enumerate(structure):
         for idx in chap.get("use_clusters", []):
             if isinstance(idx, int):
                 referenced_indices.add(idx)
 
     max_idx = len(clusters) - 1
 
-    # 审查 1: 幻觉防范 - 确保引用的聚类 ID 不越界
-    for chap in structure:
+    # 审查每个章节
+    for i, chap in enumerate(structure):
+        chap_name = chap.get("chapter", f"章节{i+1}")
+        issues = []
+
+        # 检查 1: 幻觉防范
         for idx in chap.get("use_clusters", []):
             if not isinstance(idx, int) or idx < 0 or idx > max_idx:
-                chap_name = chap.get("chapter", "未知章节")
-                feedbacks.append(f"章节「{chap_name}」引用了不存在的簇编号 #{idx}。最大簇编号为 #{max_idx}。")
+                issues.append(f"引用了不存在的簇编号 #{idx}（最大编号为 #{max_idx}）")
 
-    # 审查 2: 漏审防范 - 确保重要观点（count >= 2 代表有起码两个人复述过这件事）没有被埋没丢弃
+        if issues:
+            chapter_issues[chap_name] = issues
+        else:
+            correct_chapters.append(chap_name)
+
+    # 检查 2: 漏审防范（全局问题，不标记到具体章节）
+    missing_clusters = []
     for i, cl in enumerate(clusters):
         if cl.get("count", 1) >= 2 and i not in referenced_indices:
             topic = cl.get("topic", f"簇#{i}")
-            feedbacks.append(f"核心观点遗漏：请将高频观点「#{i} {topic}」(出现{cl.get('count')}次)分配并纳入到一个合理的大纲章节中。")
+            missing_clusters.append(f"#{i} {topic}（出现{cl.get('count')}次）")
 
-    passed = len(feedbacks) == 0
-    if passed:
-        logger.info("[Synthesis][Observe] 大纲审查一次性通过，极其严谨！")
+    # ── 构建结构化反馈 ──
+    if not chapter_issues and not missing_clusters:
+        logger.info("[Synthesis][Observe] 大纲审查通过")
         return {"_synthesis_done": True, "_outline_feedback": ""}
-    else:
-        feedback_text = "；\\n".join(feedbacks)
-        logger.warning(f"[Synthesis][Observe] 大纲被驳回，发现 {len(feedbacks)} 个问题。要求重写。")
-        return {"_synthesis_done": False, "_outline_feedback": feedback_text}
+
+    # 构建反馈文本
+    feedback_parts = []
+
+    # 1. 正确的章节（保留）
+    if correct_chapters:
+        feedback_parts.append(f"【保留章节】以下章节无需修改：\n" + "\n".join([f"  - {name}" for name in correct_chapters]))
+
+    # 2. 有问题的章节（需修改）
+    if chapter_issues:
+        feedback_parts.append("【需修改章节】以下章节存在问题：")
+        for chap_name, issues in chapter_issues.items():
+            feedback_parts.append(f"  - 「{chap_name}」：" + "；".join(issues))
+
+    # 3. 遗漏的观点（需补充）
+    if missing_clusters:
+        feedback_parts.append(f"【遗漏观点】以下重要观点未被引用，请补充到合适章节：\n" + "\n".join([f"  - {cl}" for cl in missing_clusters]))
+
+    feedback_text = "\n\n".join(feedback_parts)
+    logger.warning(f"[Synthesis][Observe] 大纲被驳回，发现 {len(chapter_issues)} 个问题章节，{len(missing_clusters)} 个遗漏观点")
+
+    return {"_synthesis_done": False, "_outline_feedback": feedback_text}
 
 
 def _route_synthesis(state: GraphState) -> Literal["execute_report", "plan_outline"]:

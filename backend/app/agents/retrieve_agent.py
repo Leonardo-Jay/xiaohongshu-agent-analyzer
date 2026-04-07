@@ -13,7 +13,9 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
+import random
 from typing import Any, Literal
 
 from loguru import logger
@@ -21,14 +23,14 @@ from loguru import logger
 from app.models.schemas import GraphState
 from app.prompts.templates import REACT_ACTION_PROMPT, RETRIEVE_EXPAND_PROMPT
 from app.tools.llm import create_llm
-from app.tools.mcp_client import XhsMcpClient
+from app.tools.mcp_client import XhsMcpClient, XhsMcpClientPool
 
 _llm_first = create_llm(temperature=0)
 _llm_expand = create_llm(temperature=0)
 
 _MAX_RETRIEVE_ROUNDS = 3  # 最多 3 轮 ReAct 循环
-_MIN_POSTS = 20  # 目标最少帖子数
-_MAX_POSTS_PER_ROUND = 20  # 单轮最多新帖子
+_MIN_POSTS = 15  # 目标最少帖子数
+_MAX_POSTS_PER_ROUND = 15  # 单轮最多新帖子
 
 
 def _parse_keywords_json(text: str) -> list[str]:
@@ -135,30 +137,100 @@ async def node_plan_keywords(state: GraphState, config: dict[str, Any]) -> dict[
 
 
 async def node_fetch_posts(state: GraphState, config: dict[str, Any]) -> dict[str, Any]:
-    """ReAct Fetch Posts 节点：执行 MCP 检索
+    """ReAct Fetch Posts 节点：并发执行 MCP 检索（使用连接池）
 
     功能：
-      - 遍历 _current_batch 中的每个关键词
-      - 调用 client.search_posts(keyword, require_num=5) 搜索帖子
+      - 从配置中获取连接池（大小 MCP_POOL_SIZE，默认 2）
+      - 使用连接池并发搜索帖子（每个关键词一个任务）
       - 按 note_id 去重，新帖子追加到 retrieved_posts
-      - 对新帖子调用 client.fetch_post_detail(url) 拉取详情
+      - 对新帖子并发调用 client.fetch_post_detail(url) 拉取详情
       - 新帖子总量上限 15 篇（单轮）
       - search_attempts += 1
+
+    加速设计：
+      - 搜索阶段：使用连接池并发执行多个关键词搜索
+      - 详情阶段：并发拉取所有新帖子的详情
+      - 完成后连接池自动关闭，释放资源
     """
     current_batch = state.get("_current_batch", [])
     existing_posts = state.get("retrieved_posts", [])
     existing_ids = {p["note_id"] for p in existing_posts}
 
-    # 从 config 获取 MCP client 和 queue
-    client: XhsMcpClient = config.get("configurable", {}).get("client")
+    # 从 config 获取连接池和 queue
+    pool: XhsMcpClientPool = config.get("configurable", {}).get("pool")
     queue = config.get("configurable", {}).get("queue")
 
-    if not client:
-        logger.warning("[Retrieve][FetchPosts] MCP client not found in config")
+    # 如果没有连接池，尝试从 client 创建临时连接池
+    if not pool:
+        client: XhsMcpClient = config.get("configurable", {}).get("client")
+        if client:
+            logger.warning("[Retrieve][FetchPosts] 未找到连接池，使用单个 client 串行执行")
+            return await _fetch_posts_serial(current_batch, existing_posts, existing_ids, client, queue)
+        logger.warning("[Retrieve][FetchPosts] MCP client/pool not found in config")
         return {"retrieved_posts": existing_posts, "search_attempts": state.get("search_attempts", 0) + 1}
 
     new_posts: list[dict[str, Any]] = []
     search_attempts = state.get("search_attempts", 0) + 1
+
+    # 并发搜索：每个关键词一个任务
+    async def _search_keyword(keyword: str) -> list[dict]:
+        try:
+            # 添加随机延迟（0.8~2.5 秒），模拟人类搜索行为
+            await asyncio.sleep(random.uniform(0.8, 2.0))
+            async with pool.borrow() as client:
+                posts = await client.search_posts(keyword, require_num=5)
+                logger.info(f"[Retrieve][FetchPosts] 搜索 '{keyword}' 获取 {len(posts)} 篇")
+                return posts
+        except Exception as e:
+            logger.warning(f"[Retrieve][FetchPosts] search_posts failed for '{keyword}': {e}")
+            if "登录已过期" in str(e) or "login" in str(e).lower():
+                raise RuntimeError("COOKIE_EXPIRED")
+            return []
+
+    # 执行并发搜索
+    search_tasks = [asyncio.create_task(_search_keyword(kw)) for kw in current_batch]
+    search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
+
+    # 收集结果并去重
+    for result in search_results:
+        if isinstance(result, Exception):
+            continue
+        for p in result:
+            note_id = p.get("note_id")
+            if note_id and note_id not in existing_ids:
+                existing_ids.add(note_id)
+                new_posts.append(p)
+                if len(new_posts) >= _MAX_POSTS_PER_ROUND:
+                    break
+        if len(new_posts) >= _MAX_POSTS_PER_ROUND:
+            break
+
+    if not new_posts:
+        logger.info(f"[Retrieve][FetchPosts] 无新帖子，累计 {len(existing_posts)} 篇")
+        return {"retrieved_posts": existing_posts, "search_attempts": search_attempts}
+
+    # 并发拉取详情
+    enriched = await _fetch_details_concurrent(new_posts, pool, queue)
+
+    combined = existing_posts + enriched
+    logger.info(f"[Retrieve][FetchPosts] 本轮获取 {len(enriched)} 篇，累计 {len(combined)} 篇")
+
+    return {
+        "retrieved_posts": combined,
+        "search_attempts": search_attempts,
+    }
+
+
+async def _fetch_posts_serial(
+    current_batch: list[str],
+    existing_posts: list[dict],
+    existing_ids: set[str],
+    client: XhsMcpClient,
+    queue
+) -> dict[str, Any]:
+    """串行版本（向后兼容）：当没有连接池时使用。"""
+    new_posts: list[dict[str, Any]] = []
+    search_attempts = 1
 
     for keyword in current_batch:
         logger.info(f"[Retrieve][FetchPosts] 搜索：{keyword}")
@@ -215,6 +287,53 @@ async def node_fetch_posts(state: GraphState, config: dict[str, Any]) -> dict[st
         "retrieved_posts": combined,
         "search_attempts": search_attempts,
     }
+
+
+async def _fetch_details_concurrent(
+    new_posts: list[dict],
+    pool: XhsMcpClientPool,
+    queue
+) -> list[dict]:
+    """并发拉取帖子详情。"""
+    enriched: list[dict] = []
+    total = len(new_posts)
+
+    async def _fetch_detail(post: dict, index: int) -> dict | None:
+        try:
+            url = post.get("note_url")
+            if url:
+                # 添加随机延迟（0.3~1.2 秒）
+                await asyncio.sleep(random.uniform(0.3, 1.2))
+                async with pool.borrow() as client:
+                    detail = await client.fetch_post_detail(url)
+                    merged = {**post, **detail}
+                logger.info(f"[Retrieve][FetchDetails] {index + 1}/{total}: {merged.get('title', '无标题')[:20]}")
+                return merged
+            return post
+        except Exception as e:
+            logger.warning(f"[Retrieve][FetchDetails] fetch detail failed {post.get('note_id')}: {e}")
+            return post
+
+    # 并发拉取详情（使用连接池，自动限流）
+    detail_tasks = [asyncio.create_task(_fetch_detail(p, i)) for i, p in enumerate(new_posts)]
+    results = await asyncio.gather(*detail_tasks, return_exceptions=True)
+
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            enriched.append(new_posts[i])
+        elif result is not None:
+            enriched.append(result)
+
+        # 推送进度事件
+        if queue is not None:
+            merged = enriched[-1] if enriched else new_posts[i]
+            title = merged.get("title") or merged.get("desc", "")[:20] or f"帖子 {i + 1}"
+            queue.put_nowait({
+                "event": "post_reading",
+                "data": {"index": i + 1, "total": total, "title": title},
+            })
+
+    return enriched
 
 
 async def node_check_coverage(state: GraphState) -> dict[str, Any]:

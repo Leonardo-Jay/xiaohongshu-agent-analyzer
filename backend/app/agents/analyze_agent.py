@@ -4,8 +4,10 @@
 
 核心流程：
   1. Select Posts: 按评论数 + 相关性加权选择本轮要爬取的帖子（top-3 优先）
-  2. Fetch Comments: 并发爬取评论（40 秒总超时），过滤无效评论（纯 emoji、无意义内容）
-  3. Check Quality & Cluster: 质量检查（规则）+ 观点聚类（LLM），决定是否需要继续爬取
+  2. Fetch Comments: 并发爬取评论（30 秒总超时），过滤无效评论
+  3. Cluster Opinions: 对所有爬取的评论进行观点聚类（LLM，60 秒超时）
+  4. Validate Clusters: 验证观点簇与意图的相关性（LLM，30 秒超时），删除不相关观点
+  5. Check Quality: 质量检查（规则），决定是否需要继续爬取
 
 循环终止条件：
   - 评论总数 >= 30 条 且 有冲突观点（正负面都有）→ 结束
@@ -23,7 +25,7 @@ from typing import Any, Literal
 from loguru import logger
 
 from app.models.schemas import GraphState
-from app.prompts.templates import OPINION_PROMPT
+from app.prompts.templates import OPINION_PROMPT, VALIDATE_CLUSTERS_PROMPT
 from app.tools.llm import create_llm
 from app.tools.mcp_client import XhsMcpClientPool
 
@@ -32,7 +34,7 @@ _llm = create_llm(temperature=0)
 _MAX_ANALYZE_ROUNDS = 2  # 最多 2 轮 ReAct 循环
 _MIN_COMMENTS = 15  # 最少评论数（触发终止条件）
 _TARGET_COMMENTS = 30  # 目标评论数
-_TOP_POSTS_PER_ROUND = 3  # 每轮爬取评论的帖子数
+_TOP_POSTS_PER_ROUND = 4  # 每轮爬取评论的帖子数
 
 
 def _is_valid_comment(content: str) -> bool:
@@ -154,7 +156,7 @@ async def node_select_posts(state: GraphState) -> dict[str, Any]:
 
     logger.info(
         f"[Analyze][SelectPosts] Round {round_num}: "
-        f"剩余 {len(remaining_posts)} 篇，选择 {num_to_fetch} 篇: {selected_ids}"
+        f"剩余 {len(remaining_posts)} 篇，选择 {num_to_fetch} 篇：{selected_ids}"
     )
 
     return {
@@ -164,19 +166,21 @@ async def node_select_posts(state: GraphState) -> dict[str, Any]:
 
 
 async def node_fetch_comments(state: GraphState, config: dict) -> dict[str, Any]:
-    """Fetch Comments 节点：爬取评论（40 秒总超时）
+    """Fetch Comments 节点：爬取评论（30 秒总超时）
 
     功能：
       - 从 _posts_to_fetch 获取本轮要爬取的帖子
       - 从 screened_items 中找到对应的帖子详情
-      - 使用连接池并发爬取评论（40 秒超时）
+      - 使用连接池并发爬取评论（30 秒超时）
       - 过滤无效评论（纯 emoji、无意义内容）
       - 将帖子正文作为博主评论插入
+      - 保存原始评论到 _raw_comments_for_clustering，供后续聚类节点使用
+
+    注意：此节点不做 LLM 聚类，只负责爬取评论
     """
     posts_to_fetch_ids = state.get("_posts_to_fetch", [])
     screened_items = state.get("screened_items", [])
     existing_comments = state.get("retrieved_comments", [])
-    existing_clusters = state.get("clusters", [])
 
     # 找到本轮要爬取的帖子详情
     id_to_post = {p.get("note_id"): p for p in screened_items}
@@ -186,7 +190,7 @@ async def node_fetch_comments(state: GraphState, config: dict) -> dict[str, Any]
         logger.warning("[Analyze][FetchComments] 未找到要爬取的帖子")
         return {
             "retrieved_comments": existing_comments,
-            "clusters": existing_clusters,
+            "_raw_comments_for_clustering": state.get("_raw_comments_for_clustering", []),
             "_fetched_comment_count": len(existing_comments),
         }
 
@@ -197,12 +201,12 @@ async def node_fetch_comments(state: GraphState, config: dict) -> dict[str, Any]
         logger.warning("[Analyze][FetchComments] 连接池未找到")
         return {
             "retrieved_comments": existing_comments,
-            "clusters": existing_clusters,
+            "_raw_comments_for_clustering": state.get("_raw_comments_for_clustering", []),
             "_fetched_comment_count": len(existing_comments),
         }
 
-    async def _process_post(post: dict) -> tuple[list[dict], list[dict]]:
-        """爬取单篇帖子的评论并进行观点聚类。"""
+    async def _process_post(post: dict) -> list[dict]:
+        """爬取单篇帖子的评论（不做聚类）。"""
         note_id = post.get("note_id", "")
         note_url = post.get("note_url", "")
 
@@ -214,6 +218,10 @@ async def node_fetch_comments(state: GraphState, config: dict) -> dict[str, Any]
             logger.warning(f"[Analyze] 借用客户端失败 {note_id}: {e}")
             comments = []
 
+        # 为每条评论添加 note_id 标记（用于聚类时分组）
+        for c in comments:
+            c["note_id"] = note_id
+
         # 将帖子正文作为博主评论插入
         desc = post.get("desc", "").strip()
         if desc:
@@ -221,70 +229,39 @@ async def node_fetch_comments(state: GraphState, config: dict) -> dict[str, Any]
                 "comment_id": f"__post_body__{note_id}",
                 "content": desc,
                 "nickname": "[博主]",
+                "note_id": note_id,
             }
             comments = [synthetic] + comments
 
         # 过滤无效评论
         comments = _filter_invalid_comments(comments)
 
-        # 观点聚类
-        clusters: list[dict] = []
-        if comments:
-            prompt = OPINION_PROMPT.format(
-                query=state.get("user_query_raw", ""),
-                title=post.get("title", ""),
-                desc=(post.get("desc") or "")[:200],
-                comments_json=json.dumps(
-                    [{"content": c.get("content", ""), "like_count": c.get("like_count", 0)}
-                     for c in comments[:50]],
-                    ensure_ascii=False,
-                ),
-            )
-            try:
-                resp = await _llm.ainvoke(prompt)
-                data = json.loads(resp.content)
-                clusters = data.get("clusters", [])
-                for cl in clusters:
-                    cl["source_note_id"] = note_id
-                    cl["source_title"] = post.get("title", "无标题")
-                    cl["source_note_url"] = note_url
-            except Exception as e:
-                logger.warning(f"[Analyze] 观点聚类失败 {note_id}: {e}")
+        return comments
 
-        return comments, clusters
-
-    # 40 秒总超时控制 —— 使用 asyncio.wait 下向兼容高低版本 Python
+    # 30 秒总超时控制 —— 使用 asyncio.wait 兼容 Python 3.10
     all_new_comments: list[dict] = []
-    all_new_clusters: list[dict] = []
 
     # 为每个帖子创建独立的任务
     tasks = [asyncio.create_task(_process_post(p)) for p in target_posts]
-    done_results: list[tuple[list[dict], list[dict]]] = []
 
     if tasks:
-        # 使用 asyncio.wait 替代 asyncio.timeout 兼容 Python 3.10
         done_tasks, pending_tasks = await asyncio.wait(
             tasks,
-            timeout=40.0,
+            timeout=30.0,
             return_when=asyncio.ALL_COMPLETED
         )
 
         for task in done_tasks:
             try:
                 result = task.result()
-                done_results.append(result)
+                all_new_comments.extend(result)
             except Exception as e:
-                logger.warning(f"[Analyze][FetchComments] 处理已完成任务时遇到异常: {e}")
+                logger.warning(f"[Analyze][FetchComments] 处理已完成任务时遇到异常：{e}")
 
         if pending_tasks:
-            logger.warning(f"[Analyze][FetchComments] 40 秒超时，保留已完成评论。取消 {len(pending_tasks)} 个未完成任务。")
+            logger.warning(f"[Analyze][FetchComments] 30 秒超时，保留已完成评论。取消 {len(pending_tasks)} 个未完成任务。")
             for p_task in pending_tasks:
                 p_task.cancel()
-
-    # 收集已完成任务的结果
-    for comments, clusters in done_results:
-        all_new_comments.extend(comments)
-        all_new_clusters.extend(clusters)
 
     # 去重评论
     seen_ids = {c.get("comment_id") for c in existing_comments}
@@ -295,20 +272,151 @@ async def node_fetch_comments(state: GraphState, config: dict) -> dict[str, Any]
             seen_ids.add(cid)
             unique_new_comments.append(c)
 
-    # 合并聚类结果
-    all_clusters = existing_clusters + all_new_clusters
-
     total_count = len(existing_comments) + len(unique_new_comments)
     logger.info(
-        f"[Analyze][FetchComments] 获取 {len(unique_new_comments)} 条新评论，"
-        f"累计 {total_count} 条，{len(all_new_clusters)} 个新观点簇"
+        f"[Analyze][FetchComments] 获取 {len(unique_new_comments)} 条新评论，累计 {total_count} 条"
     )
 
     return {
         "retrieved_comments": existing_comments + unique_new_comments,
-        "clusters": all_clusters,
+        "_raw_comments_for_clustering": all_new_comments,
         "_fetched_comment_count": total_count,
     }
+
+
+async def node_cluster_opinions(state: GraphState, config: dict) -> dict[str, Any]:
+    """Cluster Opinions 节点：批量聚类所有评论（60 秒超时）
+
+    改动：
+      - 一次性处理所有评论，不按 note 分组
+      - 强制要求输出 7~14 个观点簇
+      - 超时从 90 秒降至 60 秒
+    """
+    raw_comments = state.get("_raw_comments_for_clustering", [])
+    screened_items = state.get("screened_items", [])
+    existing_clusters = state.get("clusters", [])
+
+    logger.info(f"[Analyze][ClusterOpinions] 输入评论数={len(raw_comments)}")
+
+    if not raw_comments:
+        logger.info("[Analyze][ClusterOpinions] 无评论需要聚类")
+        return {"clusters": existing_clusters}
+
+    # 构建 note_id 到帖子信息的映射（用于后续补充 source 字段）
+    id_to_post = {p.get("note_id"): p for p in screened_items}
+
+    # 准备评论数据（最多 200 条，避免 token 超限）
+    comments_data = [
+        {
+            "content": c.get("content", ""),
+            "like_count": c.get("like_count", 0),
+            "nickname": c.get("nickname", ""),
+            "note_id": c.get("note_id", "")
+        }
+        for c in raw_comments[:200]
+    ]
+
+    # 构建全局聚类 Prompt
+    prompt = OPINION_PROMPT.format(
+        query=state.get("user_query_raw", ""),
+        comment_count=len(comments_data),
+        all_comments_json=json.dumps(comments_data, ensure_ascii=False)
+    )
+
+    try:
+        # 60 秒超时
+        resp = await asyncio.wait_for(_llm.ainvoke(prompt), timeout=60.0)
+        data = json.loads(resp.content)
+        clusters = data.get("clusters", [])
+
+        # 为每个 cluster 补充 source_note_url 和 source_title（从该簇评论的 note_id 推断）
+        # 由于是批量聚类，LLM 可能不知道具体来源，我们从评论数据中恢复
+        for cl in clusters:
+            # 尝试从该簇的 quotes 反推来源 note_id
+            # 简化处理：直接使用第一个有 note_id 的评论作为来源
+            for c in comments_data:
+                if c.get("note_id"):
+                    post = id_to_post.get(c["note_id"], {})
+                    cl["source_note_url"] = post.get("note_url", "")
+                    cl["source_title"] = post.get("title", "无标题")
+                    break
+
+        logger.info(f"[Analyze][ClusterOpinions] 输出 {len(clusters)} 个观点簇")
+
+        return {"clusters": clusters}
+
+    except asyncio.TimeoutError:
+        logger.warning("[Analyze][ClusterOpinions] 聚类超时 60 秒")
+        return {"clusters": existing_clusters}
+    except Exception as e:
+        logger.warning(f"[Analyze][ClusterOpinions] 聚类失败：{e}")
+        return {"clusters": existing_clusters}
+
+
+async def node_validate_clusters(state: GraphState, config: dict) -> dict[str, Any]:
+    """Validate Clusters 节点：验证观点簇与意图的相关性（30 秒超时）
+
+    功能：
+      - 调用 LLM 判断每个观点簇与 intent、key_aspects、user_needs 的相关性
+      - 删除相关性分数 < 0.4 的观点簇
+      - 如果删除后观点簇数量 < 5，标记需要重新爬取
+    """
+    clusters = state.get("clusters", [])
+    intent = state.get("intent", "general")
+    key_aspects = state.get("key_aspects", [])
+    user_needs = state.get("user_needs", [])
+
+    if not clusters:
+        logger.info("[Analyze][ValidateClusters] 无观点簇需要验证")
+        return {"clusters": []}
+
+    # 构建验证 Prompt
+    prompt = VALIDATE_CLUSTERS_PROMPT.format(
+        intent=intent,
+        key_aspects=json.dumps(key_aspects, ensure_ascii=False),
+        user_needs="、".join(user_needs) if user_needs else "无",
+        clusters_json=json.dumps(clusters, ensure_ascii=False)
+    )
+
+    try:
+        # 30 秒超时
+        resp = await asyncio.wait_for(_llm.ainvoke(prompt), timeout=30.0)
+        data = json.loads(resp.content)
+        validated_clusters = data.get("clusters", [])
+
+        # 恢复 source 字段（根据 topic 匹配原始观点簇）
+        original_clusters_map = {cl.get("topic"): cl for cl in clusters}
+        for validated_cl in validated_clusters:
+            topic = validated_cl.get("topic")
+            if topic in original_clusters_map:
+                original_cl = original_clusters_map[topic]
+                validated_cl["source_note_url"] = original_cl.get("source_note_url", "")
+                validated_cl["source_title"] = original_cl.get("source_title", "")
+
+        # 统计过滤结果
+        original_count = len(clusters)
+        filtered_count = len(validated_clusters)
+        removed_count = original_count - filtered_count
+
+        logger.info(
+            f"[Analyze][ValidateClusters] 验证完成: "
+            f"原始 {original_count} 个观点簇，保留 {filtered_count} 个，删除 {removed_count} 个不相关观点"
+        )
+
+        # 如果观点簇数量 < 5，标记需要重新爬取
+        need_refetch = filtered_count < 5
+
+        return {
+            "clusters": validated_clusters,
+            "_need_refetch": need_refetch,
+        }
+
+    except asyncio.TimeoutError:
+        logger.warning("[Analyze][ValidateClusters] 验证超时 30 秒，保留原观点簇")
+        return {"clusters": clusters}
+    except Exception as e:
+        logger.warning(f"[Analyze][ValidateClusters] 验证失败：{e}，保留原观点簇")
+        return {"clusters": clusters}
 
 
 def _has_conflicting_sentiment(clusters: list) -> bool:
@@ -362,6 +470,11 @@ async def node_check_quality(state: GraphState) -> dict[str, Any]:
         should_stop = True
         stop_reason = "无更多帖子可爬"
 
+    # 条件 5：观点簇相关性不足，需要重新爬取
+    if state.get("_need_refetch") and round_num < _MAX_ANALYZE_ROUNDS:
+        should_stop = False
+        stop_reason = "观点簇相关性不足，需要爬取更多帖子"
+
     # 汇总情感
     sentiment_counts: dict[str, int] = {}
     for cl in clusters:
@@ -399,10 +512,10 @@ def _route_analyze(state: GraphState) -> Literal["__end__"]:
 
 
 def build_analyze_graph():
-    """构建 Analyze 子图（三节点流水线）
+    """构建 Analyze 子图（五节点流水线）
 
     完整流程：
-      select_posts → fetch_comments → check_quality
+      select_posts → fetch_comments → cluster_opinions → validate_clusters → check_quality
     """
     from langgraph.graph import StateGraph
 
@@ -411,6 +524,8 @@ def build_analyze_graph():
     # 添加所有节点
     g.add_node("select_posts", node_select_posts)
     g.add_node("fetch_comments", node_fetch_comments)
+    g.add_node("cluster_opinions", node_cluster_opinions)
+    g.add_node("validate_clusters", node_validate_clusters)
     g.add_node("check_quality", node_check_quality)
 
     # 设置入口点
@@ -418,7 +533,9 @@ def build_analyze_graph():
 
     # 设置边连接
     g.add_edge("select_posts", "fetch_comments")
-    g.add_edge("fetch_comments", "check_quality")
+    g.add_edge("fetch_comments", "cluster_opinions")
+    g.add_edge("cluster_opinions", "validate_clusters")
+    g.add_edge("validate_clusters", "check_quality")
     g.add_edge("check_quality", "__end__")
 
     return g.compile()
