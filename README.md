@@ -116,7 +116,7 @@ npm install
 
 #### 4）配置环境变量
 
-直接在`backend/'目录下创建'.env'文件，然后 在`backend/.env`中填写配置：
+直接在`backend/`目录下创建'.env'文件，然后 在`backend/.env`中填写配置：
 
 ```env
 # ===== 小红书 Cookie =====
