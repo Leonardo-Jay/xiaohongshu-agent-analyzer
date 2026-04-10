@@ -35,6 +35,7 @@ class AnalysisRequestV2(BaseModel):
     query: str = Field(..., min_length=1, max_length=200, description="产品舆情分析关键词")
     session_id: str | None = Field(None, description="可选会话 ID，用于复用或幂等")
     cookie: str | None = Field(None, description="用户提供的小红书 Cookie，覆盖 .env")
+    enable_memory: bool | None = Field(None, description="是否开启记忆功能，覆盖环境变量 ENABLE_MEMORY")
 
     @field_validator("query")
     @classmethod
@@ -71,7 +72,13 @@ async def start_analysis(req: AnalysisRequestV2, request: Request):
         "ip": client_ip,
         "started_at": time.time(),
     }
-    task = asyncio.create_task(_run_and_cleanup(run_id, req.query, q, cookie=req.cookie))
+    task = asyncio.create_task(_run_and_cleanup(
+        run_id,
+        req.query,
+        q,
+        cookie=req.cookie,
+        enable_memory=req.enable_memory
+    ))
     _tasks[run_id]["task"] = task
     logger.info(f"[Routes] 任务启动 run_id={run_id} query={req.query}")
     append_audit_log(
@@ -85,9 +92,15 @@ async def start_analysis(req: AnalysisRequestV2, request: Request):
     return {"run_id": run_id, "query": req.query}
 
 
-async def _run_and_cleanup(run_id: str, query: str, q: asyncio.Queue, cookie: str | None = None) -> None:
+async def _run_and_cleanup(
+    run_id: str,
+    query: str,
+    q: asyncio.Queue,
+    cookie: str | None = None,
+    enable_memory: bool | None = None
+) -> None:
     try:
-        await run_analysis(query, run_id, q, cookie=cookie)
+        await run_analysis(query, run_id, q, cookie=cookie, enable_memory=enable_memory)
         if run_id in _tasks:
             _tasks[run_id]["status"] = "done"
             append_audit_log(

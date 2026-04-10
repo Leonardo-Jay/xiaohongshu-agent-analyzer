@@ -11,7 +11,7 @@ CLASSIFY_PROMPT = """
   "aliases": ["别名1", "别名2"],
   "entities_confidence": 0.0至1.0的数字,
   "key_aspects": [
-    {{"aspect": "关注方面（如：battery, camera, price等）", "priority": "high|medium|low", "user_sentiment": "positive|negative|neutral"}}
+    {{"aspect": "关注方面（中文，如：电池续航、相机拍照、价格性价比、游戏性能、发热散热等）", "priority": "high|medium|low", "user_sentiment": "positive|negative|neutral"}}
   ],
   "user_needs": ["用户需求1", "用户需求2", "用户需求3"],
   "rewritten_query": "更清晰、更适合搜索的查询语句（中文）",
@@ -31,7 +31,7 @@ intent 说明:
 - general: 其他通用查询
 
 key_aspects 说明:
-- aspect: 用户关注的具体方面（如：battery电池、camera相机、price价格等）
+- aspect: 用户关注的具体方面，必须用中文描述（如：电池续航、相机拍照、价格性价比、游戏性能、发热散热、系统流畅度、外观设计等）
 - priority: 优先级（high高优先级、medium中等、low低优先级）
 - user_sentiment: 用户情感倾向（positive正面、negative负面、neutral中立）
 
@@ -333,7 +333,7 @@ INTENT_ACTION_PROMPT = """
   "aliases": ["补充的别名"],
   "entities_confidence": 0.0至1.0的数字,
   "key_aspects": [
-    {{"aspect": "补充的关注方面", "priority": "high|medium|low", "user_sentiment": "positive|negative|neutral"}}
+    {{"aspect": "补充的关注方面（中文，如：游戏性能、发热散热、续航表现等）", "priority": "high|medium|low", "user_sentiment": "positive|negative|neutral"}}
   ],
   "user_needs": ["补充的用户需求1", "补充的用户需求2"],
   "improvement_summary": "本轮改进的要点说明"

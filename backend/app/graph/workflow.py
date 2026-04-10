@@ -10,13 +10,19 @@
   4. analyze_subgraph（内部流水线：select_posts → fetch_comments → cluster_opinions → check_quality）
      - 选择 top 帖子爬取评论（30 秒超时），过滤无效评论，然后关闭 MCP 连接进行观点聚类（90 秒）
   5. synthesize (Synthesis Agent)
+
+记忆机制:
+  - 长期记忆：本地文件系统存储，跨会话复用
+  - 短期记忆：内存会话记忆，同 session 内复用
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import traceback
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -29,6 +35,9 @@ from app.agents.screen_agent import build_screen_graph
 from app.models.schemas import GraphState
 from app.tools.mcp_client import XhsMcpClient, XhsMcpClientPool
 from app.utils.daily_audit_log import append_audit_log
+from app.utils.memory_storage import MemoryBlock, MemoryStorage
+from app.utils.memory_retrieval import get_memory_retrieval, ReuseDecision
+from app.utils.session_memory import get_session_manager
 
 # 编译 orchestrator 子图（ReAct 循环）
 _orchestrator_app = build_orchestrator_graph()
@@ -46,7 +55,13 @@ def _progress(queue: asyncio.Queue, stage: str, message: str, progress: int) -> 
     queue.put_nowait({"event": "progress", "data": {"stage": stage, "message": message, "progress": progress}})
 
 
-async def run_analysis(query: str, run_id: str, queue: asyncio.Queue, cookie: str | None = None) -> None:
+async def run_analysis(
+    query: str,
+    run_id: str,
+    queue: asyncio.Queue,
+    cookie: str | None = None,
+    enable_memory: bool | None = None
+) -> None:
     """在后台 task 中执行全流程，结果/错误通过 queue 发送。"""
     state: GraphState = {
         "request_id": run_id,
@@ -123,50 +138,222 @@ async def run_analysis(query: str, run_id: str, queue: asyncio.Queue, cookie: st
             "orchestrator",
             f"意图：{state.get('intent')}，实体：{state.get('product_entities')}，"
             f"质量分数：{state.get('intent_analysis_score', 0.0):.2f}",
-            20,
+            18,
         )
 
-        # ── 2. Retrieve Subgraph (ReAct: plan_keywords → fetch_posts → check_coverage)
-        #     接收 orchestrator 的 search_context，生成检索关键词并执行搜索
-        #     直到帖子数量 >= 10 篇或达到 3 轮上限
-        #     使用连接池并发搜索（MCP_POOL_SIZE=2），完成后关闭池
-        _progress(queue, "retrieve", "正在并发检索相关帖子...", 25)
-        retrieve_pool_size = int(os.getenv("MCP_POOL_SIZE", "2"))
-        async with XhsMcpClientPool(size=retrieve_pool_size, cookie=cookie) as retrieve_pool:
-            config = {"configurable": {"pool": retrieve_pool, "queue": queue}}
-            retrieve_output = await _retrieve_app.ainvoke(state, config=config)
-        state = {**state, **retrieve_output}
-        logger.info(
-            f"[Workflow][Retrieve] finished: posts={len(state.get('retrieved_posts', []))}, "
-            f"attempts={state.get('search_attempts', 0)}, "
-            f"coverage={state.get('retrieval_coverage_score', 0.0):.2f}"
-        )
-        _progress(queue, "retrieve", f"检索到 {len(state.get('retrieved_posts', []))} 篇帖子", 30)
+        # ── 2. 记忆检索阶段 ──
+        # 使用传入的配置，如果没有则使用默认值（默认关闭）
+        enable_memory_flag = enable_memory if enable_memory is not None else (os.getenv("ENABLE_MEMORY", "false").lower() == "true")
 
-        # ── 3. Screen Subgraph (流水线：pre_filter → detect_ads → rank_and_select)
-        #     使用 orchestrator 的 key_aspects、user_needs 进行相关性筛选，过滤广告/软广
-        #     输出 8~10 篇最相关的帖子
-        _progress(queue, "screen", "正在筛选相关帖子（过滤广告/软广）...", 35)
-        screen_output = await _screen_app.ainvoke(state)
-        state = {**state, **screen_output}
+        reuse_decision: ReuseDecision | None = None
 
-        screened = state.get("screened_items", [])
-        if not screened:
-            raise RuntimeError("筛选后无相关帖子，请尝试更换关键词")
-        _progress(queue, "screen", f"筛选出 {len(screened)} 篇相关帖子", 38)
+        # 获取 session_id 用于短期记忆
+        session_id = state.get("session_id", "")
 
-        # ── 4. Analyze（连接池并发：只启动 3 个 MCP 子进程，所有帖子共享）
-        _progress(queue, "analyze", "正在并发获取评论并分析舆情（最长约 1 分钟）...", 56)
-        pool_size = int(os.getenv("MCP_POOL_SIZE", "2"))
-        pool_size = max(1, min(pool_size, len(state.get("screened_items", [])) or 1))
-        async with XhsMcpClientPool(size=pool_size, cookie=cookie) as pool:
-            config = {"configurable": {"pool": pool, "queue": queue}}
-            analyze_output = await _analyze_app.ainvoke(state, config=config)
-        state = {**state, **analyze_output}
+        if enable_memory_flag:
+            _progress(queue, "memory", "正在检索历史记忆...", 20)
 
-        comment_count = len(state.get("retrieved_comments", []))
-        cluster_count = len(state.get("clusters", []))
-        _progress(queue, "analyze", f"已分析 {comment_count} 条评论，生成 {cluster_count} 个观点簇", 78)
+            # 从 Orchestrator 获取准确的实体和意图
+            entity = state.get("product_entities", [""])[0] if state.get("product_entities") else ""
+            intent = state.get("intent", "general")
+            key_aspects_raw = state.get("key_aspects", [])
+
+            # 提取 aspect 字符串（key_aspects 是字典列表）
+            key_aspects = [
+                item["aspect"] if isinstance(item, dict) else item
+                for item in key_aspects_raw
+            ]
+
+            # 尝试长期记忆检索
+            if entity:
+                memory_retrieval = get_memory_retrieval()
+                reuse_decision = await memory_retrieval.retrieve_and_decide(
+                    entity=entity,
+                    current_query=query,
+                    intent=intent,
+                    key_aspects=key_aspects,  # NEW: 传入用户关注点
+                    use_llm=True
+                )
+
+            if reuse_decision and reuse_decision.can_reuse:
+                logger.info(
+                    f"[Workflow][Memory] LLM 决策: coverage={reuse_decision.coverage_ratio:.2f}, "
+                    f"strategy={reuse_decision.reuse_strategy}, "
+                    f"reusable_clusters={len(reuse_decision.reusable_clusters)}"
+                )
+
+                # 将决策结果注入 state
+                state["_reuse_strategy"] = reuse_decision.reuse_strategy
+                state["_coverage_ratio"] = reuse_decision.coverage_ratio
+                state["_reusable_clusters"] = reuse_decision.reusable_clusters
+
+                progress_msg = f"发现历史记忆（覆盖度 {reuse_decision.coverage_ratio*100:.0f}%），策略：{reuse_decision.reuse_strategy}"
+                logger.info(f"[Workflow][Memory] 发送进度消息: {progress_msg}")
+                _progress(
+                    queue,
+                    "memory",
+                    progress_msg,
+                    25
+                )
+            else:
+                _progress(queue, "memory", "无历史记忆，从头开始分析", 25)
+
+        # ── 根据复用策略决定后续流程 ──
+        if reuse_decision and reuse_decision.reuse_strategy == "full":
+            # 完全复用模式：跳过 Retrieve/Screen/Analyze
+            logger.info("[Workflow] 完全复用模式：跳过爬取和聚类")
+
+            # 直接使用历史观点簇
+            state["clusters"] = reuse_decision.reusable_clusters
+
+            # DEBUG: 打印 reusable_clusters 的结构
+            logger.info(f"[Workflow] DEBUG: reusable_clusters count = {len(reuse_decision.reusable_clusters)}")
+            if reuse_decision.reusable_clusters:
+                first_cluster = reuse_decision.reusable_clusters[0]
+                logger.info(f"[Workflow] DEBUG: first cluster keys = {list(first_cluster.keys())}")
+                logger.info(f"[Workflow] DEBUG: first cluster topic = {first_cluster.get('topic')}")
+                logger.info(f"[Workflow] DEBUG: first cluster evidence_ids = {first_cluster.get('evidence_ids', [])}")
+
+            # 为完全复用模式生成 references
+            entity = state.get("product_entities", [""])[0] if state.get("product_entities") else ""
+            references = []
+
+            for cluster in reuse_decision.reusable_clusters:
+                cluster_topic = cluster.get("topic", "历史观点")
+                cluster_sentiment = cluster.get("sentiment", "中立")
+                evidence_ids = cluster.get("evidence_ids", [])
+
+                # 收集该簇的评论内容
+                quotes = []
+                source_note_id = None
+                source_note_url = None
+                source_title = None
+
+                for evidence_id in evidence_ids[:3]:  # 最多取3条
+                    # 加载证据文件
+                    evidence_file = Path(__file__).parent.parent.parent / "data" / "memory" / "entities" / entity / "evidence" / f"{evidence_id}.json"
+                    if evidence_file.exists():
+                        try:
+                            with open(evidence_file, "r", encoding="utf-8") as f:
+                                evidence = json.load(f)
+
+                            # 提取内容
+                            content = evidence.get("content", "")
+                            if content:
+                                quotes.append(content)
+
+                            # 提取来源信息（使用第一个证据的来源）
+                            if not source_note_id:
+                                source_note_id = evidence.get("note_id", "")
+                                source_note_url = evidence.get("note_url", "")
+                                source_title = evidence.get("note_title", "无标题")
+                        except Exception as e:
+                            logger.warning(f"[Workflow] 加载证据失败: {evidence_id}, error={e}")
+
+                if quotes and source_note_url:
+                    references.append({
+                        "topic": cluster_topic,
+                        "sentiment": cluster_sentiment,
+                        "source_note_url": source_note_url,
+                        "source_title": source_title,
+                        "quotes": quotes
+                    })
+                    logger.info(
+                        f"[Workflow] 生成 reference: cluster={cluster_topic}, "
+                        f"title={source_title}, quotes={len(quotes)}"
+                    )
+
+            # 注入到 state，供 Synthesis Agent 使用
+            state["references"] = references
+            logger.info(f"[Workflow] 生成了 {len(references)} 个 references")
+            state["retrieved_comments"] = []
+            state["screened_items"] = []
+            state["retrieved_posts"] = []
+
+            # 跳过 Retrieve/Screen/Analyze，显示进度
+            _progress(queue, "retrieve", "复用历史记忆，跳过爬取", 50)
+            _progress(queue, "screen", "复用历史记忆，跳过筛选", 60)
+            _progress(queue, "analyze", "复用历史记忆，跳过聚类", 70)
+
+        else:
+            # 增量更新或从头开始：执行 Retrieve/Screen/Analyze
+            # ── 2. Retrieve Subgraph ──
+            if reuse_decision and reuse_decision.reuse_strategy == "incremental":
+                # 增量模式：缩减爬取量
+                target_posts = max(3, int(7 * (1 - reuse_decision.coverage_ratio * 0.7)))
+                state["_target_posts"] = target_posts
+                logger.info(f"[Workflow] 增量更新模式：目标 {target_posts} 篇帖子")
+                _progress(queue, "retrieve", f"增量模式：爬取 {target_posts} 篇帖子", 25)
+            else:
+                # 从头开始：正常流程
+                # 注：不设置 state["_target_posts"]，由 retrieve_agent 使用默认值 _MIN_POSTS=7
+                _progress(queue, "retrieve", "正在检索相关帖子...", 25)
+
+            # 执行检索
+            retrieve_pool_size = int(os.getenv("MCP_POOL_SIZE", "1"))
+            async with XhsMcpClientPool(size=retrieve_pool_size, cookie=cookie) as retrieve_pool:
+                config = {"configurable": {"pool": retrieve_pool, "queue": queue}}
+                retrieve_output = await _retrieve_app.ainvoke(state, config=config)
+            state = {**state, **retrieve_output}
+            logger.info(
+                f"[Workflow][Retrieve] finished: posts={len(state.get('retrieved_posts', []))}, "
+                f"attempts={state.get('search_attempts', 0)}, "
+                f"coverage={state.get('retrieval_coverage_score', 0.0):.2f}"
+            )
+            _progress(queue, "retrieve", f"检索到 {len(state.get('retrieved_posts', []))} 篇帖子", 28)
+
+            # ── 3. Screen Subgraph ──
+            _progress(queue, "screen", "正在筛选相关帖子（过滤广告/软广）...", 35)
+            screen_output = await _screen_app.ainvoke(state)
+            state = {**state, **screen_output}
+
+            screened = state.get("screened_items", [])
+            if not screened:
+                raise RuntimeError("筛选后无相关帖子，请尝试更换关键词")
+
+            # 构建详细的筛选消息
+            stats = state.get("screening_stats", {})
+            rejected_ad = stats.get("rejected_ad", 0)
+            rejected_brand = stats.get("rejected_brand", 0)
+            rejected_contact = stats.get("rejected_contact", 0)
+            rejected_low_relevance = stats.get("rejected_low_relevance", 0)
+
+            screen_msg = f"筛选出 {len(screened)} 篇相关帖子"
+            exclude_details = []
+            if rejected_ad > 0:
+                exclude_details.append(f"{rejected_ad} 篇广告/软广")
+            if rejected_brand > 0:
+                exclude_details.append(f"{rejected_brand} 篇品牌号")
+            if rejected_contact > 0:
+                exclude_details.append(f"{rejected_contact} 篇含联系方式")
+            if rejected_low_relevance > 0:
+                exclude_details.append(f"{rejected_low_relevance} 篇相关性不足")
+            if exclude_details:
+                screen_msg += f"，排除 {'、'.join(exclude_details)}"
+
+            _progress(queue, "screen", screen_msg, 38)
+            logger.info(f"[Workflow][Screen] {screen_msg}")
+
+            # ── 4. Analyze ──
+            _progress(queue, "analyze", "正在获取评论并分析舆情（最长约 1 分钟）...", 56)
+            pool_size = int(os.getenv("MCP_POOL_SIZE", "2"))
+            pool_size = max(1, min(pool_size, len(state.get("screened_items", [])) or 1))
+            async with XhsMcpClientPool(size=pool_size, cookie=cookie) as pool:
+                config = {"configurable": {"pool": pool, "queue": queue}}
+                analyze_output = await _analyze_app.ainvoke(state, config=config)
+            state = {**state, **analyze_output}
+
+            # 构建详细的分析消息
+            comment_count = len(state.get("retrieved_comments", []))
+            cluster_count = len(state.get("clusters", []))
+            filtered_comment_count = state.get("_filtered_comment_count", 0)
+
+            analyze_msg = f"已分析 {comment_count} 条评论，生成 {cluster_count} 个观点簇"
+            if filtered_comment_count > 0:
+                analyze_msg += f"，过滤 {filtered_comment_count} 条无效评论"
+
+            _progress(queue, "analyze", analyze_msg, 78)
+            logger.info(f"[Workflow][Analyze] {analyze_msg}")
 
         # ── 5. Synthesize (Plan and Execute 架构)
         _progress(queue, "synthesize", "正在制定报告大纲与生成分析报告...", 82)
@@ -177,6 +364,64 @@ async def run_analysis(query: str, run_id: str, queue: asyncio.Queue, cookie: st
         for k, v in synthesis_output.items():
             state[k] = v
         _progress(queue, "synthesize", "报告生成完毕", 97)
+
+        # ── 集成到实体记忆（Ingest 操作）──
+        if enable_memory and state.get("product_entities"):
+            try:
+                from app.memory import get_memory_manager, get_evidence_saver
+
+                entity = state.get("product_entities", [""])[0]
+                intent = state.get("intent", "general")
+                clusters = state.get("clusters", [])
+                screened_items = state.get("screened_items", [])
+                retrieved_comments = state.get("retrieved_comments", [])
+                reuse_strategy = state.get("_reuse_strategy", "none")
+
+                # 调用记忆集成（异步保存证据）
+                memory_manager = get_memory_manager()
+
+                # 异步保存证据（不阻塞报告生成）
+                evidence_saver = get_evidence_saver()
+                evidence_saver.save_evidence_async(
+                    entity=entity,
+                    screened_items=screened_items,
+                    clusters=clusters,
+                    retrieved_comments=retrieved_comments
+                )
+
+                # 立即更新记忆（不等证据保存完成）
+                memory_manager.ingest_analysis_result(
+                    entity=entity,
+                    clusters=clusters,
+                    screened_items=screened_items,
+                    retrieved_comments=retrieved_comments,
+                    query=query,
+                    intent=intent,
+                    request_id=run_id,
+                    reuse_strategy=reuse_strategy,
+                    skip_evidence_save=True  # NEW: 跳过同步保存，使用异步保存
+                )
+
+                logger.info(f"[Workflow][Memory] 记忆集成完成: entity={entity}")
+
+            except Exception as e:
+                logger.warning(f"[Workflow][Memory] 记忆集成失败: {e}")
+
+        # ── 更新短期会话记忆 ──
+        if enable_memory and session_id and state.get("product_entities"):
+            try:
+                session_manager = get_session_manager()
+                session_manager.update_session(
+                    session_id=session_id,
+                    query=query,
+                    entity=state.get("product_entities", [""])[0],
+                    intent=state.get("intent", "general"),
+                    note_ids=[p.get("note_id", "") for p in state.get("screened_items", [])],
+                    clusters=state.get("clusters", [])
+                )
+                logger.info(f"[Workflow][Memory] 已更新短期会话记忆: session_id={session_id}")
+            except Exception as e:
+                logger.warning(f"[Workflow][Memory] 更新会话记忆失败: {e}")
 
         # ── 推送最终结果（references 由 synthesis_agent 生成）
         queue.put_nowait({

@@ -1,7 +1,11 @@
 <template>
   <div>
     <!-- 固定右上角配置按钮 -->
-    <div style="position:fixed;top:16px;right:20px;z-index:200">
+    <div style="position:fixed;top:16px;right:20px;z-index:200;display:flex;align-items:center;gap:12px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="font-size:14px;color:#606266">开启记忆</span>
+        <el-switch v-model="enableMemory" @change="saveEnableMemory" />
+      </div>
       <el-button @click="configVisible=true">配置 Cookie</el-button>
     </div>
 
@@ -239,6 +243,18 @@ function saveCookie() {
   ElMessage.success('Cookie 已保存')
 }
 
+// 记忆开关状态（从localStorage加载，默认关闭）
+const enableMemory = ref(localStorage.getItem('enable_memory') === 'true')
+
+function saveEnableMemory(val) {
+  if (val) {
+    localStorage.setItem('enable_memory', 'true')
+  } else {
+    localStorage.setItem('enable_memory', 'false')
+  }
+  ElMessage.success(val ? '已开启记忆功能' : '已关闭记忆功能')
+}
+
 function resetToHero() {
   stopAnalysis()
   started.value = false
@@ -327,7 +343,11 @@ async function startAnalysis() {
     const resp = await fetch('/api/v1/analysis/product', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ query: query.value.trim(), cookie: cookieInput.value.trim() || undefined }),
+      body: JSON.stringify({
+        query: query.value.trim(),
+        cookie: cookieInput.value.trim() || undefined,
+        enable_memory: enableMemory.value
+      }),
     })
     if (!resp.ok) {
       let detail = `HTTP ${resp.status}`

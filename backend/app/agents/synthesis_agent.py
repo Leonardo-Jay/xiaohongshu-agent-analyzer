@@ -259,6 +259,18 @@ async def node_execute_report(state: GraphState, config: dict) -> dict[str, Any]
 
 async def node_evaluate_and_score(state: GraphState) -> dict[str, Any]:
     """Score 节点：抛弃 LLM，利用强规则进行增强型 40/30/15/15 加权打分，并梳理所有 references。"""
+    # 如果已经有 references（完全复用模式），直接返回
+    if state.get("references"):
+        logger.info(f"[Synthesis][Score] 检测到预生成的 references ({len(state.get('references', []))} 个)，跳过重新计算")
+        clusters = state.get("clusters", [])
+        data_score = min(1.0, len(clusters) / 8.0)
+        return {
+            "confidence_score": data_score,
+            "limitations": [],
+            "references": state.get("references", [])
+        }
+
+    # 正常流程：从 clusters 计算 references
     post_count = len(state.get("screened_items", []))
     comment_count = len(state.get("retrieved_comments", []))
     clusters = state.get("clusters", [])
@@ -266,9 +278,9 @@ async def node_evaluate_and_score(state: GraphState) -> dict[str, Any]:
     limitations = []
 
     # 1. 维度1：数据底座（权重 40%）
-    if post_count >= 8 and comment_count >= 30: data_score = 1.0
-    elif post_count >= 5 and comment_count >= 20: data_score = 0.8
-    elif post_count >= 3 and comment_count >= 10: data_score = 0.6
+    if post_count >= 5 and comment_count >= 20: data_score = 1.0
+    elif post_count >= 3 and comment_count >= 12: data_score = 0.8
+    elif post_count >= 2 and comment_count >= 7: data_score = 0.6
     elif post_count >= 2 and comment_count >= 5: data_score = 0.4
     elif post_count >= 1: data_score = 0.3
     else:

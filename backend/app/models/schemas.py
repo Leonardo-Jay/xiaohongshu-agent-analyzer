@@ -77,12 +77,15 @@ class GraphState(TypedDict, total=False):
     _screen_done: bool
     _pre_filter_passed: list[dict[str, Any]]  # 初筛通过的帖子列表
     _ad_detect_passed: list[dict[str, Any]]   # 广告检测通过的帖子列表（真实分享）
+    _pre_filter_stats: dict[str, Any]         # 初筛统计：{rejected_ad, rejected_brand, rejected_contact}
+    _ad_detect_stats: dict[str, Any]          # 广告检测统计：{ad_detected, genuine}
 
     # ── 内部控制字段（analyze 子图内部）
     _analyze_round: int
     _analyze_done: bool
     _posts_to_fetch: list[str]               # 本轮要爬取的帖子 note_id 列表
     _fetched_comment_count: int              # 已获取的评论总数
+    _filtered_comment_count: int             # 已过滤的无效评论总数
     _raw_comments_for_clustering: list[dict[str, Any]]  # 原始评论列表（供聚类使用）
     _need_refetch: bool  # 是否需要重新爬取评论（观点簇相关性不足）
 

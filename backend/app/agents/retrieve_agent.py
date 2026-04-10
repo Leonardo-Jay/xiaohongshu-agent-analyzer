@@ -29,8 +29,8 @@ _llm_first = create_llm(temperature=0)
 _llm_expand = create_llm(temperature=0)
 
 _MAX_RETRIEVE_ROUNDS = 3  # 最多 3 轮 ReAct 循环
-_MIN_POSTS = 15  # 目标最少帖子数
-_MAX_POSTS_PER_ROUND = 15  # 单轮最多新帖子
+_MIN_POSTS = 7  # 目标最少帖子数
+_MAX_POSTS_PER_ROUND = 7  # 单轮最多新帖子
 
 
 def _parse_keywords_json(text: str) -> list[str]:
@@ -73,6 +73,22 @@ async def node_plan_keywords(state: GraphState, config: dict[str, Any]) -> dict[
     retrieved_posts = state.get("retrieved_posts", [])
     round_num = state.get("_retrieve_round", 0) + 1
 
+    # 获取记忆复用参数
+    reuse_ratio = state.get("_reuse_ratio", 0.0)
+    exclude_note_ids = state.get("_exclude_note_ids", [])
+    exclude_set = set(exclude_note_ids) if exclude_note_ids else set()
+
+    # 优先使用 workflow 传入的目标（增量模式时已计算），否则自己计算
+    target_posts = state.get("_target_posts")
+    if target_posts is None:
+        target_posts = _MIN_POSTS
+        if reuse_ratio > 0:
+            # 最多减少 80%
+            target_posts = max(3, int(_MIN_POSTS * (1 - reuse_ratio * 0.8)))
+            logger.info(f"[Retrieve] 记忆复用模式: reuse_ratio={reuse_ratio}, 目标={target_posts} 篇, 排除 {len(exclude_set)} 个历史帖子")
+    else:
+        logger.info(f"[Retrieve] 使用 workflow 传入的目标: {target_posts} 篇, 排除 {len(exclude_set)} 个历史帖子")
+
     # 第 1 轮使用 REACT_ACTION_PROMPT，后续轮次使用 RETRIEVE_EXPAND_PROMPT
     if round_num == 1:
         entities_str = ",".join(entities) if entities else query
@@ -92,7 +108,7 @@ async def node_plan_keywords(state: GraphState, config: dict[str, Any]) -> dict[
             search_context=json.dumps(search_context, ensure_ascii=False),
             used_keywords="、".join(used_keywords) if used_keywords else "无",
             current_post_count=len(retrieved_posts),
-            target_count=_MIN_POSTS,
+            target_count=target_posts,
         )
         llm = _llm_expand
 
@@ -133,6 +149,8 @@ async def node_plan_keywords(state: GraphState, config: dict[str, Any]) -> dict[
         "_retrieve_round": round_num,
         "_current_batch": current_batch,
         "_used_keywords": updated_used_keywords,
+        "_target_posts": target_posts,
+        "_exclude_note_ids": list(exclude_set),
     }
 
 
@@ -156,6 +174,10 @@ async def node_fetch_posts(state: GraphState, config: dict[str, Any]) -> dict[st
     existing_posts = state.get("retrieved_posts", [])
     existing_ids = {p["note_id"] for p in existing_posts}
 
+    # 获取排除列表（来自记忆复用）
+    exclude_note_ids = state.get("_exclude_note_ids", [])
+    exclude_set = set(exclude_note_ids) if exclude_note_ids else set()
+
     # 从 config 获取连接池和 queue
     pool: XhsMcpClientPool = config.get("configurable", {}).get("pool")
     queue = config.get("configurable", {}).get("queue")
@@ -175,10 +197,10 @@ async def node_fetch_posts(state: GraphState, config: dict[str, Any]) -> dict[st
     # 并发搜索：每个关键词一个任务
     async def _search_keyword(keyword: str) -> list[dict]:
         try:
-            # 添加随机延迟（0.8~2.5 秒），模拟人类搜索行为
-            await asyncio.sleep(random.uniform(0.8, 2.0))
+            # 添加随机延迟（1.0~2.5 秒），模拟人类搜索行为
+            await asyncio.sleep(random.uniform(1.0, 2.5))
             async with pool.borrow() as client:
-                posts = await client.search_posts(keyword, require_num=5)
+                posts = await client.search_posts(keyword, require_num=4)
                 logger.info(f"[Retrieve][FetchPosts] 搜索 '{keyword}' 获取 {len(posts)} 篇")
                 return posts
         except Exception as e:
@@ -191,12 +213,19 @@ async def node_fetch_posts(state: GraphState, config: dict[str, Any]) -> dict[st
     search_tasks = [asyncio.create_task(_search_keyword(kw)) for kw in current_batch]
     search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
 
-    # 收集结果并去重
+    # 收集结果并去重，同时过滤排除列表
     for result in search_results:
         if isinstance(result, Exception):
+            # 检查是否是 Cookie 过期错误
+            if "COOKIE_EXPIRED" in str(result) or "登录已过期" in str(result):
+                logger.error(f"[Retrieve][FetchPosts] 检测到 Cookie 过期，终止流程")
+                raise RuntimeError("COOKIE_EXPIRED")
             continue
         for p in result:
             note_id = p.get("note_id")
+            # 排除历史已分析帖子
+            if note_id in exclude_set:
+                continue
             if note_id and note_id not in existing_ids:
                 existing_ids.add(note_id)
                 new_posts.append(p)
@@ -204,6 +233,10 @@ async def node_fetch_posts(state: GraphState, config: dict[str, Any]) -> dict[st
                     break
         if len(new_posts) >= _MAX_POSTS_PER_ROUND:
             break
+
+    # 记录实际排除的数量
+    if exclude_set:
+        logger.info(f"[Retrieve][FetchPosts] 过滤了 {len(exclude_set)} 个历史帖子")
 
     if not new_posts:
         logger.info(f"[Retrieve][FetchPosts] 无新帖子，累计 {len(existing_posts)} 篇")
@@ -302,8 +335,8 @@ async def _fetch_details_concurrent(
         try:
             url = post.get("note_url")
             if url:
-                # 添加随机延迟（0.3~1.2 秒）
-                await asyncio.sleep(random.uniform(0.3, 1.2))
+                # 添加随机延迟（0.5~1.5 秒）
+                await asyncio.sleep(random.uniform(0.5, 1.5))
                 async with pool.borrow() as client:
                     detail = await client.fetch_post_detail(url)
                     merged = {**post, **detail}
@@ -320,6 +353,10 @@ async def _fetch_details_concurrent(
 
     for i, result in enumerate(results):
         if isinstance(result, Exception):
+            # 检查是否是 Cookie 过期错误
+            if "COOKIE_EXPIRED" in str(result) or "登录已过期" in str(result):
+                logger.error(f"[Retrieve][FetchDetails] 检测到 Cookie 过期，终止流程")
+                raise RuntimeError("COOKIE_EXPIRED")
             enriched.append(new_posts[i])
         elif result is not None:
             enriched.append(result)
@@ -340,7 +377,7 @@ async def node_check_coverage(state: GraphState) -> dict[str, Any]:
     """ReAct Check Coverage 节点：观察帖子数量
 
     功能：
-      - 检查 retrieved_posts 数量是否 >= _MIN_POSTS
+      - 检查 retrieved_posts 数量是否 >= 动态目标（支持记忆复用调整）
       - 检查是否达到最大轮次 _MAX_RETRIEVE_ROUNDS
       - 决定是否需要继续搜索
 
@@ -351,15 +388,18 @@ async def node_check_coverage(state: GraphState) -> dict[str, Any]:
     total = len(state.get("retrieved_posts", []))
     round_num = state.get("_retrieve_round", 0)
 
+    # 获取动态目标（记忆复用时可能减少）
+    target_posts = state.get("_target_posts", _MIN_POSTS)
+
     # 计算覆盖率分数
-    coverage_score = min(total / _MIN_POSTS, 1.0)
+    coverage_score = min(total / target_posts, 1.0) if target_posts > 0 else 1.0
 
     # 终止条件：数量够了 或 达到最大轮次
-    should_stop = total >= _MIN_POSTS or round_num >= _MAX_RETRIEVE_ROUNDS
+    should_stop = total >= target_posts or round_num >= _MAX_RETRIEVE_ROUNDS
 
     logger.info(
         f"[Retrieve][CheckCoverage] Round {round_num}: "
-        f"posts={total}, target={_MIN_POSTS}, coverage={coverage_score:.2f}, stop={should_stop}"
+        f"posts={total}, target={target_posts}, coverage={coverage_score:.2f}, stop={should_stop}"
     )
 
     return {

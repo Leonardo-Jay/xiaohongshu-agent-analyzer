@@ -32,8 +32,8 @@ _llm_ad_detect = create_llm(temperature=0)
 _llm_relevance = create_llm(temperature=0)
 
 _MAX_SCREEN_ROUNDS = 2  # 最多 2 轮筛选
-_MIN_POSTS = 8  # 最少输出帖子数
-_MAX_POSTS = 10  # 最多输出帖子数
+_MIN_POSTS = 5  # 最少输出帖子数
+_MAX_POSTS = 7  # 最多输出帖子数
 
 # 广告关键词列表（硬广检测）
 AD_KEYWORDS = [
@@ -258,6 +258,7 @@ async def node_rank_and_select(state: GraphState) -> dict[str, Any]:
       - 基于 orchestrator 的 key_aspects、user_needs、intent 评估相关性
       - 按相关性评分排序，选择 top 8~10 篇
       - 如果通过的帖子<8 篇，降级放宽条件（允许部分软广）
+      - 记忆复用模式：根据 reuse_ratio 减少筛选目标数量
     """
     query = state.get("user_query_raw", "")
     intent = state.get("intent", "general")
@@ -267,23 +268,46 @@ async def node_rank_and_select(state: GraphState) -> dict[str, Any]:
     genuine_posts = state.get("_ad_detect_passed", [])
     all_posts_after_filter = state.get("_pre_filter_passed", [])
 
+    # 获取记忆复用参数
+    reuse_ratio = state.get("_reuse_ratio", 0.0)
+
+    # 动态调整目标数量（记忆复用时减少）
+    if reuse_ratio > 0.3:
+        target_min = max(5, int(_MIN_POSTS * (1 - reuse_ratio * 0.5)))
+        target_max = max(6, int(_MAX_POSTS * (1 - reuse_ratio * 0.5)))
+        logger.info(f"[Screen][RankSelect] 记忆复用模式: reuse_ratio={reuse_ratio}, 目标 {target_min}-{target_max} 篇")
+    else:
+        target_min = _MIN_POSTS
+        target_max = _MAX_POSTS
+
+    # 获取各阶段统计信息
+    pre_filter_stats = state.get("_pre_filter_stats", {})
+    ad_detect_stats = state.get("_ad_detect_stats", {})
+
     round_num = state.get("_screen_round", 0)
 
-    # 如果真实分享 >= 8 篇，只用真实分享；否则放宽条件
-    if len(genuine_posts) >= _MIN_POSTS:
+    # 如果真实分享 >= 目标最小值，只用真实分享；否则放宽条件
+    if len(genuine_posts) >= target_min:
         candidate_posts = genuine_posts
         放宽条件 = False
     else:
         # 放宽条件：允许软广帖子参与评选
         candidate_posts = all_posts_after_filter
         放宽条件 = True
-        logger.info(f"[Screen][RankSelect] 放宽条件：genuine={len(genuine_posts)} < {_MIN_POSTS}")
+        logger.info(f"[Screen][RankSelect] 放宽条件：genuine={len(genuine_posts)} < {target_min}")
 
     if not candidate_posts:
         logger.warning("[Screen][RankSelect] 无候选帖子")
         return {
             "screened_items": [],
-            "screening_stats": {"total": 0, "passed": 0, "rejected": 0, "reject_reasons": []},
+            "screening_stats": {
+                "total": 0,
+                "passed": 0,
+                "rejected_ad": 0,
+                "rejected_brand": 0,
+                "rejected_contact": 0,
+                "rejected_low_relevance": 0,
+            },
             "_screen_done": True,
         }
 
@@ -336,13 +360,13 @@ async def node_rank_and_select(state: GraphState) -> dict[str, Any]:
     # 按相关性评分降序排序
     scored_posts.sort(key=lambda x: x[0], reverse=True)
 
-    # 选择 top 8~10 篇
-    selected_count = min(len(scored_posts), _MAX_POSTS)
-    # 如果不足 8 篇，全部选中
-    selected_count = max(selected_count, min(len(scored_posts), _MIN_POSTS))
+    # 选择 top 篇（使用动态目标）
+    selected_count = min(len(scored_posts), target_max)
+    # 如果不足目标最小值，全部选中
+    selected_count = max(selected_count, min(len(scored_posts), target_min))
 
     selected = [post for score, post in scored_posts[:selected_count]]
-    rejected_count = len(candidate_posts) - len(selected)
+    rejected_by_relevance = len(candidate_posts) - len(selected)
 
     # 清理临时字段（不输出到最终结果）
     for post in selected:
@@ -350,19 +374,26 @@ async def node_rank_and_select(state: GraphState) -> dict[str, Any]:
         post.pop("_ad_detect", None)
         post.pop("_relevance", None)
 
+    # 合并各阶段统计信息
+    rejected_ad = pre_filter_stats.get("rejected_ad", 0) + ad_detect_stats.get("ad_detected", 0)
+    rejected_brand = pre_filter_stats.get("rejected_brand", 0)
+    rejected_contact = pre_filter_stats.get("rejected_contact", 0)
+
     logger.info(
         f"[Screen][RankSelect] Round {round_num}: "
-        f"候选={len(candidate_posts)}, 选中={len(selected)}, 淘汰={rejected_count}, "
-        f"放宽条件={放宽条件}"
+        f"候选={len(candidate_posts)}, 选中={len(selected)}, "
+        f"排除：广告={rejected_ad}, 品牌号={rejected_brand}, 联系方式={rejected_contact}, 相关性不足={rejected_by_relevance}"
     )
 
     return {
         "screened_items": selected,
         "screening_stats": {
-            "total": len(candidate_posts),
+            "total": pre_filter_stats.get("total", len(candidate_posts)),
             "passed": len(selected),
-            "rejected": rejected_count,
-            "reject_reasons": ["相关性不足" if 放宽条件 else "广告/软广"],
+            "rejected_ad": rejected_ad,
+            "rejected_brand": rejected_brand,
+            "rejected_contact": rejected_contact,
+            "rejected_low_relevance": rejected_by_relevance,
         },
         "_screen_done": True,
     }

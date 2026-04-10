@@ -674,7 +674,7 @@ class XHS_Apis():
                 note_out_comment_list.extend(comments)
                 if len(note_out_comment_list) == 0 or not data.get("has_more", False):
                     break
-                if len(note_out_comment_list) >= 30:  # 最多取 30 条一级评论
+                if len(note_out_comment_list) >= 20:  # 最多取 20 条一级评论
                     break
         except Exception as e:
             success = False
@@ -738,7 +738,7 @@ class XHS_Apis():
                 inner_comment_list.extend(comments)
                 if not res_json["data"]["has_more"]:
                     break
-                if len(inner_comment_list) >= 5:  # 每条一级评论最多取 5 条回复
+                if len(inner_comment_list) >= 3:  # 每条一级评论最多取 3 条回复
                     break
             comment['sub_comments'].extend(inner_comment_list)
         except Exception as e:

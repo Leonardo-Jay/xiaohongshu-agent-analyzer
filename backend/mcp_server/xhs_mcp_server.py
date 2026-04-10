@@ -243,10 +243,10 @@ async def _search_comments(args: dict) -> dict:
     if not success:
         raise RuntimeError(f"get_note_all_out_comment failed: {msg}")
 
-    # 只保留前 50 条一级评论，不展开二级评论
+    # 只保留前 33 条一级评论，不展开二级评论
     flat: list[dict] = []
     for c in raw_comments:
-        if len(flat) >= 50:
+        if len(flat) >= 33:
             break
         flat.append(_flat_comment(c, is_sub=False))
 

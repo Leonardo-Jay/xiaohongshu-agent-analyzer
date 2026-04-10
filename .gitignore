@@ -39,6 +39,9 @@ venv/
 # 敏感配置（包含真实 Cookie 和 API Token）
 backend/.env
 
+# 记忆数据文件夹（用户生成的分析数据）
+backend/data/
+
 # Claude Code 本地配置
 .claude/
 

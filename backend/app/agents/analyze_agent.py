@@ -32,9 +32,9 @@ from app.tools.mcp_client import XhsMcpClientPool
 _llm = create_llm(temperature=0)
 
 _MAX_ANALYZE_ROUNDS = 2  # 最多 2 轮 ReAct 循环
-_MIN_COMMENTS = 15  # 最少评论数（触发终止条件）
-_TARGET_COMMENTS = 30  # 目标评论数
-_TOP_POSTS_PER_ROUND = 4  # 每轮爬取评论的帖子数
+_MIN_COMMENTS = 10  # 最少评论数（触发终止条件）
+_TARGET_COMMENTS = 20  # 目标评论数
+_TOP_POSTS_PER_ROUND = 3  # 每轮爬取评论的帖子数
 
 
 def _is_valid_comment(content: str) -> bool:
@@ -71,17 +71,15 @@ def _is_valid_comment(content: str) -> bool:
     return True
 
 
-def _filter_invalid_comments(comments: list[dict]) -> list[dict]:
-    """过滤无效评论。"""
+def _filter_invalid_comments(comments: list[dict]) -> tuple[list[dict], int]:
+    """过滤无效评论，返回 (有效评论列表, 过滤数量)。"""
     valid = []
     for c in comments:
         content = c.get("content", "")
         if _is_valid_comment(content):
             valid.append(c)
     filtered_count = len(comments) - len(valid)
-    if filtered_count > 0:
-        logger.info(f"[Analyze][FilterComments] 过滤 {filtered_count} 条无效评论")
-    return valid
+    return valid, filtered_count
 
 
 async def _fetch_comments_with_retry(
@@ -112,6 +110,7 @@ async def node_select_posts(state: GraphState) -> dict[str, Any]:
       - 从 screened_items 中按评论数 + 相关性加权选择 top-N 帖子
       - 第 1 轮：选择评论数最多的 top-3
       - 第 2 轮：选择剩余的帖子（如果第 1 轮观点不足）
+      - 记忆复用模式：根据 reuse_ratio 减少爬取数量
 
     选择公式：
       score = comment_count * 0.7 + relevance_score * 100 * 0.3
@@ -120,6 +119,9 @@ async def node_select_posts(state: GraphState) -> dict[str, Any]:
     screened_items = state.get("screened_items", [])
     posts_to_fetch = state.get("_posts_to_fetch", [])
     round_num = state.get("_analyze_round", 0) + 1
+
+    # 获取记忆复用参数
+    reuse_ratio = state.get("_reuse_ratio", 0.0)
 
     if not screened_items:
         logger.warning("[Analyze][SelectPosts] 无可供分析的帖子")
@@ -149,8 +151,15 @@ async def node_select_posts(state: GraphState) -> dict[str, Any]:
 
     remaining_posts.sort(key=calc_score, reverse=True)
 
-    # 选择本轮要爬取的帖子
-    num_to_fetch = min(len(remaining_posts), _TOP_POSTS_PER_ROUND)
+    # 计算本轮要爬取的数量（记忆复用时减少）
+    base_num = _TOP_POSTS_PER_ROUND
+    if reuse_ratio > 0.3:
+        # 复用率高时减少爬取数量
+        reduce_factor = min(0.7, reuse_ratio * 0.8)
+        base_num = max(2, int(base_num * (1 - reduce_factor)))
+        logger.info(f"[Analyze][SelectPosts] 记忆复用模式: reuse_ratio={reuse_ratio}, 减少爬取到 {base_num} 篇")
+
+    num_to_fetch = min(len(remaining_posts), base_num)
     selected = remaining_posts[:num_to_fetch]
     selected_ids = [p.get("note_id") for p in selected]
 
@@ -181,6 +190,7 @@ async def node_fetch_comments(state: GraphState, config: dict) -> dict[str, Any]
     posts_to_fetch_ids = state.get("_posts_to_fetch", [])
     screened_items = state.get("screened_items", [])
     existing_comments = state.get("retrieved_comments", [])
+    existing_filtered_count = state.get("_filtered_comment_count", 0)
 
     # 找到本轮要爬取的帖子详情
     id_to_post = {p.get("note_id"): p for p in screened_items}
@@ -192,6 +202,7 @@ async def node_fetch_comments(state: GraphState, config: dict) -> dict[str, Any]
             "retrieved_comments": existing_comments,
             "_raw_comments_for_clustering": state.get("_raw_comments_for_clustering", []),
             "_fetched_comment_count": len(existing_comments),
+            "_filtered_comment_count": existing_filtered_count,
         }
 
     # 从 config 获取连接池
@@ -203,16 +214,21 @@ async def node_fetch_comments(state: GraphState, config: dict) -> dict[str, Any]
             "retrieved_comments": existing_comments,
             "_raw_comments_for_clustering": state.get("_raw_comments_for_clustering", []),
             "_fetched_comment_count": len(existing_comments),
+            "_filtered_comment_count": existing_filtered_count,
         }
 
-    async def _process_post(post: dict) -> list[dict]:
-        """爬取单篇帖子的评论（不做聚类）。"""
+    # 用于累积过滤统计
+    total_filtered_this_round = 0
+
+    async def _process_post(post: dict) -> tuple[list[dict], int]:
+        """爬取单篇帖子的评论（不做聚类），返回 (评论列表, 过滤数量)。"""
+        nonlocal total_filtered_this_round
         note_id = post.get("note_id", "")
         note_url = post.get("note_url", "")
 
         try:
             async with pool.borrow() as client:
-                await asyncio.sleep(random.uniform(0.5, 2.0))
+                await asyncio.sleep(random.uniform(0.8, 2.5))
                 comments = await _fetch_comments_with_retry(client, note_url, note_id)
         except Exception as e:
             logger.warning(f"[Analyze] 借用客户端失败 {note_id}: {e}")
@@ -233,10 +249,9 @@ async def node_fetch_comments(state: GraphState, config: dict) -> dict[str, Any]
             }
             comments = [synthetic] + comments
 
-        # 过滤无效评论
-        comments = _filter_invalid_comments(comments)
-
-        return comments
+        # 过滤无效评论，获取过滤统计
+        valid_comments, filtered = _filter_invalid_comments(comments)
+        return valid_comments, filtered
 
     # 30 秒总超时控制 —— 使用 asyncio.wait 兼容 Python 3.10
     all_new_comments: list[dict] = []
@@ -253,8 +268,9 @@ async def node_fetch_comments(state: GraphState, config: dict) -> dict[str, Any]
 
         for task in done_tasks:
             try:
-                result = task.result()
+                result, filtered = task.result()
                 all_new_comments.extend(result)
+                total_filtered_this_round += filtered
             except Exception as e:
                 logger.warning(f"[Analyze][FetchComments] 处理已完成任务时遇到异常：{e}")
 
@@ -273,14 +289,23 @@ async def node_fetch_comments(state: GraphState, config: dict) -> dict[str, Any]
             unique_new_comments.append(c)
 
     total_count = len(existing_comments) + len(unique_new_comments)
-    logger.info(
-        f"[Analyze][FetchComments] 获取 {len(unique_new_comments)} 条新评论，累计 {total_count} 条"
-    )
+    total_filtered = existing_filtered_count + total_filtered_this_round
+
+    if total_filtered_this_round > 0:
+        logger.info(
+            f"[Analyze][FetchComments] 获取 {len(unique_new_comments)} 条新评论，"
+            f"累计 {total_count} 条，本轮过滤 {total_filtered_this_round} 条无效评论"
+        )
+    else:
+        logger.info(
+            f"[Analyze][FetchComments] 获取 {len(unique_new_comments)} 条新评论，累计 {total_count} 条"
+        )
 
     return {
         "retrieved_comments": existing_comments + unique_new_comments,
         "_raw_comments_for_clustering": all_new_comments,
         "_fetched_comment_count": total_count,
+        "_filtered_comment_count": total_filtered,
     }
 
 
@@ -291,10 +316,21 @@ async def node_cluster_opinions(state: GraphState, config: dict) -> dict[str, An
       - 一次性处理所有评论，不按 note 分组
       - 强制要求输出 7~14 个观点簇
       - 超时从 90 秒降至 60 秒
+      - 支持记忆复用：reuse_ratio > 0.6 时直接复用观点簇
+      - 为观点簇生成 aspect_tags（用于精确匹配检索）
     """
     raw_comments = state.get("_raw_comments_for_clustering", [])
     screened_items = state.get("screened_items", [])
     existing_clusters = state.get("clusters", [])
+
+    # 获取记忆复用参数
+    reuse_ratio = state.get("_reuse_ratio", 0.0)
+    memory_context = state.get("memory_context", "")
+
+    # 高复用率时直接复用记忆中的观点簇
+    if reuse_ratio > 0.6 and existing_clusters:
+        logger.info(f"[Analyze][ClusterOpinions] 复用记忆观点簇: reuse_ratio={reuse_ratio}, 数量={len(existing_clusters)}")
+        return {"clusters": existing_clusters}
 
     logger.info(f"[Analyze][ClusterOpinions] 输入评论数={len(raw_comments)}")
 
@@ -343,6 +379,26 @@ async def node_cluster_opinions(state: GraphState, config: dict) -> dict[str, An
 
         logger.info(f"[Analyze][ClusterOpinions] 输出 {len(clusters)} 个观点簇")
 
+        # 为观点簇生成三层标签（主标签、子标签、同义标签）
+        try:
+            from app.utils.aspect_tagger import get_aspect_tagger
+            tagger = get_aspect_tagger()
+
+            # 判断领域类型（根据 intent）
+            intent = state.get("intent", "general")
+            domain = "product" if intent in ["product_comparison", "quality_issue", "price_value"] else "general"
+
+            # 批量生成三层标签
+            clusters = await tagger.generate_tags(clusters, domain=domain)
+            logger.info(f"[Analyze][ClusterOpinions] 为 {len(clusters)} 个观点簇生成三层标签")
+        except Exception as e:
+            logger.warning(f"[Analyze][ClusterOpinions] 三层标签生成失败: {e}")
+            # 降级：添加空标签，不影响主流程
+            for cluster in clusters:
+                cluster.setdefault("primary_aspects", [])
+                cluster.setdefault("sub_aspects", [])
+                cluster.setdefault("synonym_aspects", [])
+
         return {"clusters": clusters}
 
     except asyncio.TimeoutError:
@@ -384,14 +440,19 @@ async def node_validate_clusters(state: GraphState, config: dict) -> dict[str, A
         data = json.loads(resp.content)
         validated_clusters = data.get("clusters", [])
 
-        # 恢复 source 字段（根据 topic 匹配原始观点簇）
+        # 恢复 source 字段和标签字段（根据 topic 匹配原始观点簇）
         original_clusters_map = {cl.get("topic"): cl for cl in clusters}
         for validated_cl in validated_clusters:
             topic = validated_cl.get("topic")
             if topic in original_clusters_map:
                 original_cl = original_clusters_map[topic]
+                # 恢复 source 字段
                 validated_cl["source_note_url"] = original_cl.get("source_note_url", "")
                 validated_cl["source_title"] = original_cl.get("source_title", "")
+                # 恢复标签字段
+                validated_cl["primary_aspects"] = original_cl.get("primary_aspects", [])
+                validated_cl["sub_aspects"] = original_cl.get("sub_aspects", [])
+                validated_cl["synonym_aspects"] = original_cl.get("synonym_aspects", [])
 
         # 统计过滤结果
         original_count = len(clusters)
