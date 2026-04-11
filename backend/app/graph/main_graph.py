@@ -5,16 +5,21 @@
   → orchestrator (意图识别 ReAct 子图)
   → retrieve (检索 ReAct 子图)
   → screen (筛选子图：pre_filter → detect_ads → rank_and_select)
-  → analyze (评论分析子图：select_posts → fetch_comments → cluster_opinions → check_quality)
+  → analyze (评论分析 ReAct 子图)
+  → synthesize(报告Plan and Execute子图)
   → synthesize_answer → store_memory → stream_output → END
+
+各子图说明：
+- orchestrator: 意图识别 ReAct 子图，输出 intent, key_aspects, user_needs, search_context
+- retrieve: 检索 ReAct 子图，目标 >= 7 篇帖子，最多 3 轮循环
+- screen: 三阶段流水线，过滤广告/软广，相关性排序
+- analyze: 评论分析 ReAct 子图，每轮爬 3 篇帖子评论
+  - 终止条件: 评论>=50且冲突观点 / 评论>=40且观点簇>=5 / 达到2轮上限
+- synthesize: Plan and Execute 架构，生成分析报告
 
 注意：
 - `workflow.py` 是实际运行入口
 - `main_graph.py` 仅用于表达运行时架构与图结构导出
-- orchestrator 是意图识别子图，负责理解任务并输出高质量的意图分析结果
-- retrieve 是检索子图，负责基于 orchestrator 的 search_context 进行检索，直到帖子数量>=10 篇
-- screen 是筛选子图，负责过滤广告/软广并基于相关性排序输出 8~10 篇帖子
-- analyze 是评论分析子图，负责爬取评论、过滤无效内容、观点聚类、情感分析
 """
 from __future__ import annotations
 
@@ -256,7 +261,10 @@ def build_graph() -> StateGraph:
             "_analyze_done": state.get("_analyze_done", False),
             "_posts_to_fetch": state.get("_posts_to_fetch", []),
             "_fetched_comment_count": state.get("_fetched_comment_count", 0),
+            "_filtered_comment_count": state.get("_filtered_comment_count", 0),
+            "_need_refetch": state.get("_need_refetch", False),
             "_raw_comments_for_clustering": state.get("_raw_comments_for_clustering", []),
+            "_enable_memory": state.get("_enable_memory", False),
         }
 
     def analyze_output_mapper(state: GraphState, subgraph_output: dict[str, Any]) -> dict[str, Any]:
@@ -269,6 +277,8 @@ def build_graph() -> StateGraph:
             "_analyze_done",
             "_posts_to_fetch",
             "_fetched_comment_count",
+            "_filtered_comment_count",
+            "_need_refetch",
             "_raw_comments_for_clustering",
         }
         preserved_parent_fields = {

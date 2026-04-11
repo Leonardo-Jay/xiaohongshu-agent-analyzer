@@ -41,7 +41,7 @@
             clearable
             placeholder="输入内容关键词"
             @keyup.enter="startAnalysis"
-            style="max-width:480px;flex:1"
+            style="max-width:440px;flex:1"
           />
           <el-button type="primary" :loading="loading" :disabled="!query.trim()" @click="startAnalysis">
             {{ loading ? '分析中…' : '重新分析' }}

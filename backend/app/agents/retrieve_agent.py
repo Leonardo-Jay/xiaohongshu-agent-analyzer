@@ -5,10 +5,10 @@
 核心流程：
   1. Plan Keywords: 基于 orchestrator 的 search_context 生成检索关键词
   2. Fetch Posts: 调用 MCP 工具搜索帖子并拉取详情
-  3. Check Coverage: 检查帖子数量是否足够（>= 10 篇），决定是否需要继续搜索
+  3. Check Coverage: 检查帖子数量是否足够（>= 7 篇），决定是否需要继续搜索
 
 循环终止条件:
-  - 去重后帖子总数 >= 10 篇
+  - 去重后帖子总数 >= 7 篇
   - 达到最大检索轮次（3 轮）
 """
 from __future__ import annotations

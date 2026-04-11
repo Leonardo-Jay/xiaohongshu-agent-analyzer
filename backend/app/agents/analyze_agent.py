@@ -10,8 +10,8 @@
   5. Check Quality: 质量检查（规则），决定是否需要继续爬取
 
 循环终止条件：
-  - 评论总数 >= 30 条 且 有冲突观点（正负面都有）→ 结束
-  - 评论总数 >= 15 条 且 观点簇 >= 3 个 → 结束
+  - 评论总数 >= 50 条 且 有冲突观点（正负面都有）→ 结束
+  - 评论总数 >= 40 条 且 观点簇 >= 5 个 → 结束
   - 已达到 2 轮循环上限 → 结束
 """
 from __future__ import annotations
@@ -32,8 +32,8 @@ from app.tools.mcp_client import XhsMcpClientPool
 _llm = create_llm(temperature=0)
 
 _MAX_ANALYZE_ROUNDS = 2  # 最多 2 轮 ReAct 循环
-_MIN_COMMENTS = 10  # 最少评论数（触发终止条件）
-_TARGET_COMMENTS = 20  # 目标评论数
+_MIN_COMMENTS = 40  # 最少评论数（触发终止条件）
+_TARGET_COMMENTS = 50  # 目标评论数
 _TOP_POSTS_PER_ROUND = 3  # 每轮爬取评论的帖子数
 
 
@@ -379,25 +379,27 @@ async def node_cluster_opinions(state: GraphState, config: dict) -> dict[str, An
 
         logger.info(f"[Analyze][ClusterOpinions] 输出 {len(clusters)} 个观点簇")
 
-        # 为观点簇生成三层标签（主标签、子标签、同义标签）
-        try:
-            from app.utils.aspect_tagger import get_aspect_tagger
-            tagger = get_aspect_tagger()
+        # 为观点簇生成三层标签（仅当记忆功能开启时）
+        # 三层标签用于记忆检索的分层匹配和记忆保存的结构化存储
+        if state.get("_enable_memory"):
+            try:
+                from app.utils.aspect_tagger import get_aspect_tagger
+                tagger = get_aspect_tagger()
 
-            # 判断领域类型（根据 intent）
-            intent = state.get("intent", "general")
-            domain = "product" if intent in ["product_comparison", "quality_issue", "price_value"] else "general"
+                # 判断领域类型（根据 intent）
+                intent = state.get("intent", "general")
+                domain = "product" if intent in ["product_comparison", "quality_issue", "price_value"] else "general"
 
-            # 批量生成三层标签
-            clusters = await tagger.generate_tags(clusters, domain=domain)
-            logger.info(f"[Analyze][ClusterOpinions] 为 {len(clusters)} 个观点簇生成三层标签")
-        except Exception as e:
-            logger.warning(f"[Analyze][ClusterOpinions] 三层标签生成失败: {e}")
-            # 降级：添加空标签，不影响主流程
-            for cluster in clusters:
-                cluster.setdefault("primary_aspects", [])
-                cluster.setdefault("sub_aspects", [])
-                cluster.setdefault("synonym_aspects", [])
+                # 批量生成三层标签
+                clusters = await tagger.generate_tags(clusters, domain=domain)
+                logger.info(f"[Analyze][ClusterOpinions] 为 {len(clusters)} 个观点簇生成三层标签")
+            except Exception as e:
+                logger.warning(f"[Analyze][ClusterOpinions] 三层标签生成失败: {e}")
+                # 降级：添加空标签，不影响主流程
+                for cluster in clusters:
+                    cluster.setdefault("primary_aspects", [])
+                    cluster.setdefault("sub_aspects", [])
+                    cluster.setdefault("synonym_aspects", [])
 
         return {"clusters": clusters}
 
@@ -495,8 +497,8 @@ async def node_check_quality(state: GraphState) -> dict[str, Any]:
       - 如果未终止，标记继续循环
 
     终止条件：
-      1. 评论总数 >= 30 条 且 有冲突观点 → 结束
-      2. 评论总数 >= 15 条 且 观点簇 >= 3 个 → 结束
+      1. 评论总数 >= 50 条 且 有冲突观点 → 结束
+      2. 评论总数 >= 40 条 且 观点簇 >= 5 个 → 结束
       3. 已达到 2 轮循环上限 → 结束
     """
     comment_count = state.get("_fetched_comment_count", 0)
@@ -517,7 +519,7 @@ async def node_check_quality(state: GraphState) -> dict[str, Any]:
         stop_reason = "评论充足且有冲突观点"
 
     # 条件 2：观点簇足够
-    elif comment_count >= _MIN_COMMENTS and unique_opinion_count >= 3:
+    elif comment_count >= _MIN_COMMENTS and unique_opinion_count >= 5:
         should_stop = True
         stop_reason = f"观点簇足够 ({unique_opinion_count}个)"
 
@@ -557,26 +559,37 @@ async def node_check_quality(state: GraphState) -> dict[str, Any]:
 
     return {
         "_analyze_done": should_stop,
+        "_need_refetch": False,  # 重置，下轮重新判断
         "sentiment_summary": sentiment_counts,
         "evidence_ledger": evidence_ledger,
     }
 
 
-def _route_analyze(state: GraphState) -> Literal["__end__"]:
-    """Analyze 子图总是结束（流水线结构，非循环）
+def _route_analyze(state: GraphState) -> Literal["select_posts", "__end__"]:
+    """条件边：根据质量检查结果决定是否继续循环
 
-    注意：ReAct 循环逻辑已在 check_quality 节点内部处理，
-    通过 _analyze_done 字段控制是否继续。
-    此处固定返回结束，由外部主图决定是否重入。
+    返回值：
+      - "select_posts": 继续循环，爬取更多帖子
+      - "__end__": 结束，返回结果
     """
-    return "__end__"
+    if state.get("_analyze_done"):
+        return "__end__"
+
+    round_num = state.get("_analyze_round", 0)
+    logger.info(f"[Analyze][Route] 继续第 {round_num + 1} 轮爬取")
+    return "select_posts"
 
 
 def build_analyze_graph():
-    """构建 Analyze 子图（五节点流水线）
+    """构建 Analyze 子图（ReAct 循环）
 
     完整流程：
       select_posts → fetch_comments → cluster_opinions → validate_clusters → check_quality
+                                                                    ↓
+                                                            _analyze_done?
+                                                           ↙          ↘
+                                                    select_posts      __end__
+                                                    (继续循环)        (结束)
     """
     from langgraph.graph import StateGraph
 
@@ -597,6 +610,7 @@ def build_analyze_graph():
     g.add_edge("fetch_comments", "cluster_opinions")
     g.add_edge("cluster_opinions", "validate_clusters")
     g.add_edge("validate_clusters", "check_quality")
-    g.add_edge("check_quality", "__end__")
+    # 使用条件边实现 ReAct 循环
+    g.add_conditional_edges("check_quality", _route_analyze)
 
     return g.compile()

@@ -1,19 +1,34 @@
 """Workflow runner — 固定外层流水线，编排各 Agent/子图并通过 asyncio.Queue 推送 SSE 进度。
 
 执行顺序:
-  1. orchestrator_subgraph（内部 ReAct: reasoning → action → observation）
+  1. orchestrator_subgraph（内部 ReAct 循环）
      - 意图识别，输出 intent, key_aspects, user_needs, search_context 等
-  2. retrieve_subgraph（内部 ReAct: plan_keywords → fetch_posts → check_coverage）
-     - 基于 orchestrator 的 search_context 生成关键词，搜索帖子，直到数量>=10 篇
-  3. screen_subgraph（内部流水线：pre_filter → detect_ads → rank_and_select）
-     - 使用 orchestrator 的 key_aspects、user_needs 进行相关性筛选，过滤广告/软广
-  4. analyze_subgraph（内部流水线：select_posts → fetch_comments → cluster_opinions → check_quality）
-     - 选择 top 帖子爬取评论（30 秒超时），过滤无效评论，然后关闭 MCP 连接进行观点聚类（90 秒）
-  5. synthesize (Synthesis Agent)
 
-记忆机制:
-  - 长期记忆：本地文件系统存储，跨会话复用
-  - 短期记忆：内存会话记忆，同 session 内复用
+  2. retrieve_subgraph（内部 ReAct 循环）
+     - plan_keywords → fetch_posts → check_coverage
+     - 基于 orchestrator 的 search_context 生成关键词，搜索帖子
+     - 目标: >= 7 篇帖子，最多 3 轮循环
+     - MCP 连接池固定 1 个（避免并发爬取导致封号）
+
+  3. screen_subgraph（三阶段流水线）
+     - pre_filter → detect_ads → rank_and_select
+     - 使用 orchestrator 的 key_aspects、user_needs 进行相关性筛选
+     - 过滤广告/软广，输出 screened_items
+
+  4. analyze_subgraph（内部 ReAct 循环）
+     - select_posts → fetch_comments → cluster_opinions → validate_clusters → check_quality
+     - 选择帖子爬取评论，过滤无效评论，观点聚类
+     - 循环终止条件: 评论>=50且冲突观点 / 评论>=40且观点簇>=5 / 达到2轮上限
+     - 每轮爬取 3 篇帖子的评论，MCP 连接池大小跟随 MCP_POOL_SIZE 环境变量
+
+  5. synthesize_subgraph（Plan and Execute 架构）
+     - 制定报告大纲，生成分析报告
+
+记忆机制（Karpathy Wiki 架构）:
+  - 知识预编译：观点簇存储时生成三层标签（主标签、子标签、同义标签）
+  - 纯结构化检索：基于字符串匹配，不使用 embedding
+  - 证据驱动：每个观点簇关联原始评论证据
+  - 默认关闭，通过前端 enable_memory 参数开启
 """
 from __future__ import annotations
 
@@ -45,7 +60,7 @@ _orchestrator_app = build_orchestrator_graph()
 _retrieve_app = build_retrieve_graph()
 # 编译 screen 子图（三阶段流水线）
 _screen_app = build_screen_graph()
-# 编译 analyze 子图（四节点流水线：select_posts → fetch_comments → cluster_opinions → check_quality）
+# 编译 analyze 子图（ReAct 循环）
 _analyze_app = build_analyze_graph()
 # 编译 synthesis 子图（Plan and Execute）
 _synthesis_app = build_synthesis_graph()
@@ -89,6 +104,14 @@ async def run_analysis(
         "_retrieve_done": False,
         "_current_batch": [],
         "_used_keywords": [],
+        # Analyze 内部控制字段
+        "_analyze_round": 0,
+        "_analyze_done": False,
+        "_posts_to_fetch": [],
+        "_fetched_comment_count": 0,
+        "_filtered_comment_count": 0,
+        "_need_refetch": False,
+        "_enable_memory": enable_memory if enable_memory is not None else (os.getenv("ENABLE_MEMORY", "false").lower() == "true"),
         # 其他阶段
         "screened_items": [],
         "screening_stats": {},
@@ -175,27 +198,50 @@ async def run_analysis(
                     use_llm=True
                 )
 
-            if reuse_decision and reuse_decision.can_reuse:
-                logger.info(
-                    f"[Workflow][Memory] LLM 决策: coverage={reuse_decision.coverage_ratio:.2f}, "
-                    f"strategy={reuse_decision.reuse_strategy}, "
-                    f"reusable_clusters={len(reuse_decision.reusable_clusters)}"
-                )
+            if reuse_decision:
+                # 判断是否有历史记忆
+                has_memory = reuse_decision.entity_memory is not None
+                matched_aspects = reuse_decision.matched_aspects or []
 
-                # 将决策结果注入 state
-                state["_reuse_strategy"] = reuse_decision.reuse_strategy
-                state["_coverage_ratio"] = reuse_decision.coverage_ratio
-                state["_reusable_clusters"] = reuse_decision.reusable_clusters
+                if has_memory and matched_aspects:
+                    # 有记忆且有匹配的观点
+                    if reuse_decision.can_reuse:
+                        # 可以复用：显示覆盖度和策略
+                        logger.info(
+                            f"[Workflow][Memory] LLM 决策: coverage={reuse_decision.coverage_ratio:.2f}, "
+                            f"strategy={reuse_decision.reuse_strategy}, "
+                            f"reusable_clusters={len(reuse_decision.reusable_clusters)}"
+                        )
 
-                progress_msg = f"发现历史记忆（覆盖度 {reuse_decision.coverage_ratio*100:.0f}%），策略：{reuse_decision.reuse_strategy}"
-                logger.info(f"[Workflow][Memory] 发送进度消息: {progress_msg}")
-                _progress(
-                    queue,
-                    "memory",
-                    progress_msg,
-                    25
-                )
+                        # 将决策结果注入 state
+                        state["_reuse_strategy"] = reuse_decision.reuse_strategy
+                        state["_coverage_ratio"] = reuse_decision.coverage_ratio
+                        state["_reusable_clusters"] = reuse_decision.reusable_clusters
+
+                        progress_msg = f"发现历史记忆（覆盖度 {reuse_decision.coverage_ratio*100:.0f}%），策略：{reuse_decision.reuse_strategy}"
+                        logger.info(f"[Workflow][Memory] 发送进度消息: {progress_msg}")
+                        _progress(
+                            queue,
+                            "memory",
+                            progress_msg,
+                            25
+                        )
+                    else:
+                        # 覆盖度低，不复用：显示匹配的部分，但说明采用全新分析
+                        matched_str = "、".join(matched_aspects[:4])  # 最多显示4个
+                        if len(matched_aspects) > 4:
+                            matched_str += f"等{len(matched_aspects)}个方面"
+                        progress_msg = f"历史记忆匹配：{matched_str}（覆盖度较低，采用全新分析）"
+                        logger.info(f"[Workflow][Memory] 发送进度消息: {progress_msg}")
+                        _progress(queue, "memory", progress_msg, 25)
+                elif has_memory and not matched_aspects:
+                    # 有记忆但无匹配观点
+                    _progress(queue, "memory", "历史记忆无相关观点，从头开始分析", 25)
+                else:
+                    # 真正无历史记忆
+                    _progress(queue, "memory", "无历史记忆，从头开始分析", 25)
             else:
+                # reuse_decision 为 None（异常情况）
                 _progress(queue, "memory", "无历史记忆，从头开始分析", 25)
 
         # ── 根据复用策略决定后续流程 ──
@@ -289,9 +335,8 @@ async def run_analysis(
                 # 注：不设置 state["_target_posts"]，由 retrieve_agent 使用默认值 _MIN_POSTS=7
                 _progress(queue, "retrieve", "正在检索相关帖子...", 25)
 
-            # 执行检索
-            retrieve_pool_size = int(os.getenv("MCP_POOL_SIZE", "1"))
-            async with XhsMcpClientPool(size=retrieve_pool_size, cookie=cookie) as retrieve_pool:
+            # 执行检索（固定使用 1 个连接，避免并发爬取导致封号）
+            async with XhsMcpClientPool(size=1, cookie=cookie) as retrieve_pool:
                 config = {"configurable": {"pool": retrieve_pool, "queue": queue}}
                 retrieve_output = await _retrieve_app.ainvoke(state, config=config)
             state = {**state, **retrieve_output}

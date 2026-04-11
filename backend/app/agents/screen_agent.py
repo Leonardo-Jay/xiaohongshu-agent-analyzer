@@ -1,18 +1,18 @@
 """Screen Subgraph — 筛选 ReAct Agent
 职责：接收 orchestrator 的意图分析结果（intent、key_aspects、user_needs），
-     对 retrieve 检索到的帖子进行内容相关性筛选，过滤广告/软广，输出 8~10 篇最相关的帖子。
+     对 retrieve 检索到的帖子进行内容相关性筛选，过滤广告/软广，输出 5~7 篇最相关的帖子。
 
 核心流程：
   1. Pre Filter: 规则预过滤，过滤明显广告（硬广、品牌号、联系方式）
   2. Detect Ads: LLM 检测软广，使用压缩后的帖子摘要（省 token）
-  3. Rank and Select: 基于相关性评分排序，选择 top 8~10 篇
+  3. Rank and Select: 基于相关性评分排序，选择 top 5~7 篇
 
 压缩策略（Token 优化）：
   - 帖子正文：前 100 字 + 结尾 100 字（而非全文）
   - 单篇帖子输入从平均 800 字降至约 200 字（省 75%+ token）
 
 循环终止条件：
-  - 筛选出 8~10 篇帖子
+  - 筛选出 5~7 篇帖子
   - 或已达到 2 轮筛选上限（第 2 轮放宽条件）
 """
 from __future__ import annotations
