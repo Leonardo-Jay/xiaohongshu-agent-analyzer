@@ -1,9 +1,6 @@
 # encoding: utf-8
 import json
 import re
-import sys
-import threading
-import time
 import urllib
 import requests
 from xhs_utils.xhs_util import splice_str, generate_request_params, generate_x_b3_traceid, get_common_headers
@@ -366,7 +363,8 @@ class XHS_Apis():
         try:
             urlParse = urllib.parse.urlparse(url)
             note_id = urlParse.path.split("/")[-1]
-            kvDist = dict(urllib.parse.parse_qsl(urlParse.query))
+            kvs = urlParse.query.split('&')
+            kvDist = {kv.split('=')[0]: kv.split('=')[1] for kv in kvs}
             api = f"/api/sns/web/v1/feed"
             data = {
                 "source_note_id": note_id,
@@ -384,8 +382,7 @@ class XHS_Apis():
             headers, cookies, data = generate_request_params(cookies_str, api, data, 'POST')
             response = requests.post(self.base_url + api, headers=headers, data=data, cookies=cookies, proxies=proxies)
             res_json = response.json()
-            import sys; print(f"[get_note_info] status={response.status_code} res={str(res_json)[:200]}", file=sys.stderr, flush=True)
-            success, msg = res_json.get("success", False), res_json.get("msg") or res_json.get("message", "unknown error")
+            success, msg = res_json["success"], res_json["msg"]
         except Exception as e:
             success = False
             msg = str(e)
@@ -515,7 +512,6 @@ class XHS_Apis():
             }
             headers, cookies, data = generate_request_params(cookies_str, api, data, 'POST')
             response = requests.post(self.base_url + api, headers=headers, data=data.encode('utf-8'), cookies=cookies, proxies=proxies)
-            print(f"[search_note] status={response.status_code} body={response.text[:500]}", file=sys.stderr, flush=True)
             res_json = response.json()
             success, msg = res_json["success"], res_json["msg"]
         except Exception as e:
@@ -637,44 +633,35 @@ class XHS_Apis():
             }
             splice_api = splice_str(api, params)
             headers, cookies, data = generate_request_params(cookies_str, splice_api, '', 'GET')
-            response = requests.get(self.base_url + splice_api, headers=headers, cookies=cookies, proxies=proxies, timeout=15)
-            print(f"[get_note_out_comment] status={response.status_code} body={response.text[:500]}", file=sys.stderr, flush=True)
+            response = requests.get(self.base_url + splice_api, headers=headers, cookies=cookies, proxies=proxies)
             res_json = response.json()
-            success, msg = res_json["success"], res_json.get("msg", "")
+            success, msg = res_json["success"], res_json["msg"]
         except Exception as e:
             success = False
-            msg = f"{e} | raw={res_json}"
+            msg = str(e)
         return success, msg, res_json
 
-    def get_note_all_out_comment(self, note_id: str, xsec_token: str, cookies_str: str, proxies: dict = None, stop_event: threading.Event = None):
+    def get_note_all_out_comment(self, note_id: str, xsec_token: str, cookies_str: str, proxies: dict = None):
         """
             获取笔记的全部一级评论
             :param note_id 笔记的id
             :param cookies_str 你的cookies
-            :param stop_event 外部停止信号，set() 后立即退出循环
             返回笔记的全部一级评论
         """
         cursor = ''
         note_out_comment_list = []
         try:
             while True:
-                if stop_event is not None and stop_event.is_set():
-                    break
                 success, msg, res_json = self.get_note_out_comment(note_id, cursor, xsec_token, cookies_str, proxies)
                 if not success:
                     raise Exception(msg)
-                data = res_json.get("data", {}) if res_json else {}
-                if not data:
-                    break
-                comments = data.get("comments", [])
-                if 'cursor' in data:
-                    cursor = str(data["cursor"])
+                comments = res_json["data"]["comments"]
+                if 'cursor' in res_json["data"]:
+                    cursor = str(res_json["data"]["cursor"])
                 else:
                     break
                 note_out_comment_list.extend(comments)
-                if len(note_out_comment_list) == 0 or not data.get("has_more", False):
-                    break
-                if len(note_out_comment_list) >= 20:  # 最多取 20 条一级评论
+                if len(note_out_comment_list) == 0 or not res_json["data"]["has_more"]:
                     break
         except Exception as e:
             success = False
@@ -711,12 +698,11 @@ class XHS_Apis():
             msg = str(e)
         return success, msg, res_json
 
-    def get_note_all_inner_comment(self, comment: dict, xsec_token: str, cookies_str: str, proxies: dict = None, stop_event: threading.Event = None):
+    def get_note_all_inner_comment(self, comment: dict, xsec_token: str, cookies_str: str, proxies: dict = None):
         """
             获取笔记的全部二级评论
             :param comment 笔记的一级评论
             :param cookies_str 你的cookies
-            :param stop_event 外部停止信号，set() 后立即退出循环
             返回笔记的全部二级评论
         """
         try:
@@ -725,8 +711,6 @@ class XHS_Apis():
             cursor = comment['sub_comment_cursor']
             inner_comment_list = []
             while True:
-                if stop_event is not None and stop_event.is_set():
-                    break
                 success, msg, res_json = self.get_note_inner_comment(comment, cursor, xsec_token, cookies_str, proxies)
                 if not success:
                     raise Exception(msg)
@@ -738,34 +722,30 @@ class XHS_Apis():
                 inner_comment_list.extend(comments)
                 if not res_json["data"]["has_more"]:
                     break
-                if len(inner_comment_list) >= 3:  # 每条一级评论最多取 3 条回复
-                    break
             comment['sub_comments'].extend(inner_comment_list)
         except Exception as e:
             success = False
             msg = str(e)
         return success, msg, comment
 
-    def get_note_all_comment(self, url: str, cookies_str: str, proxies: dict = None, stop_event: threading.Event = None):
+    def get_note_all_comment(self, url: str, cookies_str: str, proxies: dict = None):
         """
             获取一篇文章的所有评论
-            :param url: 笔记 URL
+            :param note_id: 你想要获取的笔记的id
             :param cookies_str: 你的cookies
-            :param stop_event: 外部停止信号，set() 后立即退出
             返回一篇文章的所有评论
         """
         out_comment_list = []
         try:
             urlParse = urllib.parse.urlparse(url)
             note_id = urlParse.path.split("/")[-1]
-            kvDist = dict(urllib.parse.parse_qsl(urlParse.query))
-            success, msg, out_comment_list = self.get_note_all_out_comment(note_id, kvDist['xsec_token'], cookies_str, proxies, stop_event)
+            kvs = urlParse.query.split('&')
+            kvDist = {kv.split('=')[0]: kv.split('=')[1] for kv in kvs}
+            success, msg, out_comment_list = self.get_note_all_out_comment(note_id, kvDist['xsec_token'], cookies_str, proxies)
             if not success:
                 raise Exception(msg)
             for comment in out_comment_list:
-                if stop_event is not None and stop_event.is_set():
-                    break
-                success, msg, new_comment = self.get_note_all_inner_comment(comment, kvDist['xsec_token'], cookies_str, proxies, stop_event)
+                success, msg, new_comment = self.get_note_all_inner_comment(comment, kvDist['xsec_token'], cookies_str, proxies)
                 if not success:
                     raise Exception(msg)
         except Exception as e:

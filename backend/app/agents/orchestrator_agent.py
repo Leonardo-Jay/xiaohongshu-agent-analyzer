@@ -19,8 +19,9 @@ from langgraph.graph import StateGraph
 from loguru import logger
 
 from app.models.schemas import GraphState
-from app.prompts.templates import CLASSIFY_PROMPT, INTENT_ACTION_PROMPT, INTENT_OBSERVATION_PROMPT
+from app.prompts.templates import INTENT_ACTION_PROMPT, INTENT_OBSERVATION_PROMPT
 from app.tools.llm import create_llm
+from app.tools.tool_schemas import INTENT_TOOLS
 
 _llm_reasoning = create_llm(temperature=0)
 _llm_action = create_llm(temperature=0)
@@ -48,7 +49,7 @@ def _parse_reasoning_json(text: str) -> dict[str, Any]:
 
 
 async def node_reasoning(state: GraphState) -> dict[str, Any]:
-    """ReAct Reasoning 节点：深度意图分析
+    """ReAct Reasoning 节点：深度意图分析（使用 Function Calling）
 
     功能：
       - 识别意图类型（产品比较、质量问题、性价比、用户体验等）
@@ -61,40 +62,74 @@ async def node_reasoning(state: GraphState) -> dict[str, Any]:
     query = state.get("user_query_raw", "")
     round_num = state.get("_intent_round", 0) + 1
 
-    prompt = CLASSIFY_PROMPT.format(query=query)
+    # 简化的 prompt（不再需要详细的 JSON schema）
+    prompt = f"""分析用户查询意图：{query}
+
+请调用 analyze_intent 工具返回结构化的意图分析结果。"""
+
+    messages: list[dict] = [{"role": "user", "content": prompt}]
 
     try:
-        resp = await _llm_reasoning.ainvoke(prompt)
-        data = _parse_reasoning_json(resp.content)
+        # 使用 Function Calling
+        resp = await _llm_reasoning.ainvoke(messages, tools=INTENT_TOOLS)
 
-        # 从数据中提取意图分析结果
-        intent = data.get("intent", "general")
-        intent_confidence = float(data.get("intent_confidence", 0.0))
-        entities = data.get("product_entities", [])
-        aliases = data.get("aliases", [])
-        entities_confidence = float(data.get("entities_confidence", 0.0))
-        key_aspects = data.get("key_aspects", [])
-        user_needs = data.get("user_needs", [])
-        rewritten = data.get("rewritten_query", query)
-        search_context = data.get("search_context", {})
+        # 检查是否调用了工具
+        if resp.tool_calls and resp.tool_calls[0].name == "analyze_intent":
+            # 直接获取已验证的参数（无需手动解析 JSON）
+            data = resp.tool_calls[0].arguments
 
-        # 计算初步质量分数
-        intent_analysis_score = (
-            (intent_confidence * 0.4) +
-            (entities_confidence * 0.3) +
-            (min(len(user_needs), 3) / 3.0 * 0.3)
-        )
+            # 提取字段
+            intent = data.get("intent", "general")
+            intent_confidence = float(data.get("intent_confidence", 0.0))
+            entities = data.get("product_entities", [])
+            aliases = data.get("aliases", [])
+            entities_confidence = float(data.get("entities_confidence", 0.0))
+            key_aspects = data.get("key_aspects", [])
+            user_needs = data.get("user_needs", [])
+            rewritten = data.get("rewritten_query", query)
+            search_context = data.get("search_context", {})
 
-        logger.info(
-            f"[Orchestrator][Reasoning] Round {round_num}: "
-            f"intent={intent}, confidence={intent_confidence:.2f}, "
-            f"entities={entities}, score={intent_analysis_score:.2f}"
-        )
+            # 计算初步质量分数
+            intent_analysis_score = (
+                (intent_confidence * 0.4) +
+                (entities_confidence * 0.3) +
+                (min(len(user_needs), 3) / 3.0 * 0.3)
+            )
+
+            logger.info(
+                f"[Orchestrator][Reasoning] Round {round_num} (FC): "
+                f"intent={intent}, confidence={intent_confidence:.2f}, "
+                f"entities={entities}, score={intent_analysis_score:.2f}"
+            )
+
+            return {
+                "intent": intent,
+                "intent_confidence": intent_confidence,
+                "product_entities": entities,
+                "aliases": aliases,
+                "entities_confidence": entities_confidence,
+                "key_aspects": key_aspects,
+                "user_needs": user_needs,
+                "user_query_rewritten": rewritten,
+                "search_context": search_context,
+                "intent_analysis_score": intent_analysis_score,
+                "missing_dimensions": [],
+                "_intent_round": round_num,
+                "_intent_done": False,
+            }
+
+        else:
+            # LLM 没有调用工具，降级处理
+            logger.warning("[Orchestrator][Reasoning] LLM 未调用 analyze_intent 工具，使用降级策略")
+            raise Exception("LLM 未调用工具")
+
     except Exception as e:
-        logger.warning(f"[Orchestrator][Reasoning] failed: {e}")
+        logger.warning(f"[Orchestrator][Reasoning] failed: {e}, using fallback strategy")
+
+        # 降级：使用原始查询作为实体
         intent = "general"
         intent_confidence = 0.0
-        entities = []
+        entities = [query]  # 使用原始查询
         aliases = []
         entities_confidence = 0.0
         key_aspects = []
@@ -103,21 +138,21 @@ async def node_reasoning(state: GraphState) -> dict[str, Any]:
         search_context = {}
         intent_analysis_score = 0.0
 
-    return {
-        "intent": intent,
-        "intent_confidence": intent_confidence,
-        "product_entities": entities,
-        "aliases": aliases,
-        "entities_confidence": entities_confidence,
-        "key_aspects": key_aspects,
-        "user_needs": user_needs,
-        "user_query_rewritten": rewritten,
-        "search_context": search_context,
-        "intent_analysis_score": intent_analysis_score,
-        "missing_dimensions": [],
-        "_intent_round": round_num,
-        "_intent_done": False,  # 默认不结束，等待 Observation 判断
-    }
+        return {
+            "intent": intent,
+            "intent_confidence": intent_confidence,
+            "product_entities": entities,
+            "aliases": aliases,
+            "entities_confidence": entities_confidence,
+            "key_aspects": key_aspects,
+            "user_needs": user_needs,
+            "user_query_rewritten": rewritten,
+            "search_context": search_context,
+            "intent_analysis_score": intent_analysis_score,
+            "missing_dimensions": [],
+            "_intent_round": round_num,
+            "_intent_done": False,
+        }
 
 
 async def node_action(state: GraphState) -> dict[str, Any]:

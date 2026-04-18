@@ -42,6 +42,12 @@ my-vue3-vite-project/
 │  ├─ data/               # 记忆数据存储（自动生成）
 │  ├─ .env                # 环境变量配置
 │  └─ requirements.txt
+├─ skill-package/          # MCP Skill 服务器（Claude Desktop / Cursor 集成）
+│  ├─ skill_server.py     # MCP 服务器主程序
+│  ├─ install.py          # 自动安装脚本
+│  ├─ backend_manager.py  # 后端服务管理器
+│  ├─ config.py           # 配置管理
+│  └─ requirements.txt    # Skill 依赖
 ├─ Spider_XHS-master/      # 小红书抓取依赖项目
 ├─ package.json            # 前端依赖
 ├─ index.html              # Vite 前端入口 HTML
@@ -158,6 +164,164 @@ npm run dev
 默认前端开发地址：`http://localhost:8001`
 
 分析页面示例：`http://localhost:8001/analysis`
+
+---
+
+## 使用方式二：Claude Desktop / Cursor 集成（推荐）
+
+本项目提供了独立的 MCP Skill 服务器，可与 Claude Desktop、Cursor 等 AI 编辑器无缝集成，实现通过自然语言直接调用分析功能。
+
+### 快速开始
+
+#### 1）安装 Skill 依赖
+
+```bash
+cd skill-package
+pip install -r requirements.txt
+```
+
+#### 2）自动安装（推荐）
+
+```bash
+python install.py
+```
+
+安装脚本会自动：
+- ✅ 检测操作系统（macOS/Windows）
+- ✅ 定位配置文件路径
+- ✅ 填写正确的项目路径
+- ✅ 注册到 Claude Desktop / Cursor
+
+#### 3）重启 Claude Desktop / Cursor
+
+重启后即可使用新功能。
+
+### 使用方法
+
+在 Claude Desktop 或 Cursor 中输入：
+
+```
+分析 iPhone 16 的用户口碑
+```
+
+系统会自动：
+1. 抓取小红书相关帖子和评论
+2. 进行观点聚类和情感分析
+3. 生成完整的 Markdown 报告
+
+### 首次使用：配置 Cookie
+
+首次使用时，Claude 会提示你配置 Cookie。
+
+**获取 Cookie 步骤**：
+1. 打开 https://www.xiaohongshu.com 并登录
+2. 按 F12 打开开发者工具
+3. 切换到 Network 标签页
+4. 刷新页面，找到任意请求
+5. 复制请求头中的 Cookie 值
+
+**配置 Cookie**：
+
+在 Claude Desktop 中输入：
+
+```
+配置我的小红书 Cookie：[粘贴你的 Cookie]
+```
+
+Cookie 会加密存储在本地，后续使用无需重复配置。
+
+### 高级功能
+
+**启用记忆复用**（加速分析）：
+
+```
+分析小米汽车，启用记忆复用
+```
+
+系统会复用历史分析结果，显著加快分析速度。
+
+### Skill 工作原理
+
+<details>
+<summary>点击展开技术细节</summary>
+
+Skill 服务器会自动管理后端服务：
+
+1. **自动启动后端**：检测后端是否运行，未运行则自动启动
+2. **健康检查**：确保后端服务正常响应
+3. **API 调用**：通过 HTTP 调用后端分析接口
+4. **SSE 流式传输**：实时获取分析进度和结果
+5. **生命周期管理**：自动管理后端进程
+
+**架构图**：
+
+```
+Claude Desktop / Cursor (MCP 客户端)
+    ↓ 调用 analyze_xhs_sentiment 工具
+skill-package (MCP Server)
+    ↓ HTTP API 调用
+backend (FastAPI + LangGraph)
+    ↓ 多 Agent 协作
+最终 Markdown 报告
+```
+
+**工具列表**：
+
+| 工具名称 | 功能 | 参数 |
+|---------|------|------|
+| `analyze_xhs_sentiment` | 分析小红书舆情 | `query`: 关键词（必填）<br>`cookie`: Cookie（可选）<br>`enable_memory`: 记忆复用（可选） |
+| `configure_cookie` | 配置 Cookie | `cookie`: Cookie 字符串（必填） |
+
+</details>
+
+### 手动配置（可选）
+
+<details>
+<summary>如果自动安装失败，请手动配置</summary>
+
+#### Claude Desktop 配置
+
+**找到配置文件**：
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+
+**添加以下内容**：
+
+```json
+{
+  "mcpServers": {
+    "xhs-analysis": {
+      "command": "python",
+      "args": ["skill_server.py"],
+      "cwd": "你的项目路径/my-vue3-vite-project/skill-package"
+    }
+  }
+}
+```
+
+**注意**：将 `cwd` 字段修改为你的实际路径。
+
+#### Cursor IDE 配置
+
+在 Cursor 设置中添加 MCP 服务器：
+
+1. 打开 Cursor 设置（Ctrl/Cmd + ,）
+2. 搜索 "MCP Servers"
+3. 添加配置：
+
+```json
+{
+  "mcpServers": {
+    "xhs-analysis": {
+      "command": "python",
+      "args": ["skill_server.py"],
+      "cwd": "d:/IDEA/project/my-vue3-vite-project/skill-package"
+    }
+  }
+}
+```
+
+</details>
 
 ---
 
@@ -301,6 +465,130 @@ npm run dev
 Default frontend dev address: `http://localhost:8001`
 
 Analysis page: `http://localhost:8001/analysis`
+
+---
+
+## Option 2: Claude Desktop / Cursor Integration (Recommended)
+
+This project provides a standalone MCP Skill server that integrates seamlessly with AI editors like Claude Desktop and Cursor, enabling natural language-based analysis.
+
+### Quick Start
+
+#### 1) Install Skill Dependencies
+
+```bash
+cd skill-package
+pip install -r requirements.txt
+```
+
+#### 2) Automatic Installation (Recommended)
+
+```bash
+python install.py
+```
+
+The installation script automatically:
+- ✅ Detects your OS (macOS/Windows)
+- ✅ Locates configuration file paths
+- ✅ Fills in correct project paths
+- ✅ Registers with Claude Desktop / Cursor
+
+#### 3) Restart Claude Desktop / Cursor
+
+Restart to activate the new functionality.
+
+### Usage
+
+In Claude Desktop or Cursor, type:
+
+```
+Analyze the user reviews for iPhone 16
+```
+
+The system will automatically:
+1. Scrape relevant Xiaohongshu posts and comments
+2. Perform opinion clustering and sentiment analysis
+3. Generate a complete Markdown report
+
+### First-Time Setup: Configure Cookie
+
+On first use, Claude will prompt you to configure the Cookie.
+
+**Getting the Cookie**:
+1. Open https://www.xiaohongshu.com and log in
+2. Press F12 to open Developer Tools
+3. Switch to the Network tab
+4. Refresh the page and find any request
+5. Copy the Cookie value from request headers
+
+**Configuring Cookie**:
+
+In Claude Desktop, type:
+
+```
+Configure my Xiaohongshu Cookie: [paste your cookie]
+```
+
+The Cookie will be encrypted and stored locally; no need to repeat.
+
+### Advanced Features
+
+**Enable Memory Reuse** (faster analysis):
+
+```
+Analyze Xiaomi EV, enable memory reuse
+```
+
+The system will reuse historical analysis results for faster processing.
+
+### Manual Configuration (Optional)
+
+<details>
+<summary>Click to expand if automatic installation fails</summary>
+
+#### Claude Desktop Configuration
+
+**Find the config file**:
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+
+**Add the following**:
+
+```json
+{
+  "mcpServers": {
+    "xhs-analysis": {
+      "command": "python",
+      "args": ["skill_server.py"],
+      "cwd": "/path/to/your/project/skill-package"
+    }
+  }
+}
+```
+
+**Note**: Replace the `cwd` field with your actual path.
+
+#### Cursor IDE Configuration
+
+Add MCP server in Cursor settings:
+
+1. Open Cursor Settings (Ctrl/Cmd + ,)
+2. Search for "MCP Servers"
+3. Add configuration:
+
+```json
+{
+  "mcpServers": {
+    "xhs-analysis": {
+      "command": "python",
+      "args": ["skill_server.py"],
+      "cwd": "d:/IDEA/project/my-vue3-vite-project/skill-package"
+    }
+  }
+}
+```
+
+</details>
 
 ---
 

@@ -1,11 +1,13 @@
 """LangGraph 共享状态定义。
 
-使用 TypedDict（LangGraph 原生支持），而非 Pydantic，
-以便直接传入 StateGraph。
+使用 TypedDict + Annotated reducer（LangGraph 原生支持）。
+累加型列表字段使用 operator.add reducer，节点只需返回增量；
+其余字段使用默认 last-write-wins 语义。
 """
 from __future__ import annotations
 
-from typing import Any, TypedDict
+import operator
+from typing import Annotated, Any, TypedDict
 
 from pydantic import BaseModel, Field
 
@@ -20,31 +22,31 @@ class GraphState(TypedDict, total=False):
     session_id: str
     user_query_raw: str
 
-    # ── Orchestrator输出（意图分析结果）
+    # ── Orchestrator 输出（覆盖型）
     user_query_rewritten: str
-    intent: str                        # product_comparison | quality_issue | price_value | user_experience | general
-    intent_confidence: float           # 意图识别置信度
+    intent: str
+    intent_confidence: float
     product_entities: list[str]
     aliases: list[str]
-    entities_confidence: float         # 实体识别置信度
-    key_aspects: list[dict[str, Any]]  # [{aspect, priority, user_sentiment}]
+    entities_confidence: float
+    key_aspects: list[dict[str, Any]]
     user_needs: list[str]
-    search_context: dict[str, Any]     # 给Retrieve Agent的搜索提示
-    intent_analysis_score: float       # 综合质量分数（0-1）
-    missing_dimensions: list[str]      # 识别出的缺失分析维度
+    search_context: dict[str, Any]
+    intent_analysis_score: float
+    missing_dimensions: list[str]
 
-    # ── Retrieval 阶段（Retrieve Agent负责）
+    # ── Retrieval 阶段（累加型用 Annotated）
     query_plan: list[str]
     search_attempts: int
-    retrieved_posts: list[dict[str, Any]]
+    retrieved_posts: Annotated[list[dict[str, Any]], operator.add]
     retrieval_coverage_score: float
 
-    # ── Screen 阶段
+    # ── Screen 阶段（覆盖型）
     screened_items: list[dict[str, Any]]
-    screening_stats: dict[str, Any]    # {total, passed, rejected, reject_reasons}
+    screening_stats: dict[str, Any]
 
-    # ── Opinion 阶段
-    retrieved_comments: list[dict[str, Any]]
+    # ── Analyze 阶段（累加 + 覆盖混合）
+    retrieved_comments: Annotated[list[dict[str, Any]], operator.add]
     clusters: list[dict[str, Any]]
     sentiment_summary: dict[str, Any]
     evidence_ledger: list[dict[str, Any]]
@@ -52,48 +54,65 @@ class GraphState(TypedDict, total=False):
     # ── Memory
     memory_context: str
 
-    # ── Synthesis 阶段
+    # ── Synthesis 阶段（覆盖型）
     confidence_score: float
     limitations: list[str]
     final_answer: str
     references: list[dict[str, Any]]
 
-    # ── 错误与流
-    tool_errors: list[dict[str, Any]]
-    stream_events: list[dict[str, Any]]  # 供 SSE 推送的进度事件
+    # ── 错误与流（累加型）
+    tool_errors: Annotated[list[dict[str, Any]], operator.add]
+    stream_events: Annotated[list[dict[str, Any]], operator.add]
 
-    # ── 内部控制字段（orchestrator 子图内部）
+    # ── 内部控制：orchestrator
     _intent_round: int
     _intent_done: bool
 
-    # ── 内部控制字段（retrieve 子图内部）
+    # ── 内部控制：retrieve
     _retrieve_round: int
     _retrieve_done: bool
-    _current_batch: list[str]        # 本轮要搜索的关键词
-    _used_keywords: list[str]        # 已使用过的所有关键词（防重复）
+    _current_batch: list[str]
+    _used_keywords: Annotated[list[str], operator.add]
+    _target_posts: int
+    _exclude_note_ids: list[str]
 
-    # ── 内部控制字段（screen 子图内部）
+    # ── 内部控制：screen
     _screen_round: int
     _screen_done: bool
-    _pre_filter_passed: list[dict[str, Any]]  # 初筛通过的帖子列表
-    _ad_detect_passed: list[dict[str, Any]]   # 广告检测通过的帖子列表（真实分享）
-    _pre_filter_stats: dict[str, Any]         # 初筛统计：{rejected_ad, rejected_brand, rejected_contact}
-    _ad_detect_stats: dict[str, Any]          # 广告检测统计：{ad_detected, genuine}
+    _pre_filter_passed: list[dict[str, Any]]
+    _ad_detect_passed: list[dict[str, Any]]
+    _pre_filter_stats: dict[str, Any]
+    _ad_detect_stats: dict[str, Any]
 
-    # ── 内部控制字段（analyze 子图内部）
+    # ── 内部控制：analyze
     _analyze_round: int
     _analyze_done: bool
-    _posts_to_fetch: list[str]               # 本轮要爬取的帖子 note_id 列表
-    _fetched_comment_count: int              # 已获取的评论总数
-    _filtered_comment_count: int             # 已过滤的无效评论总数
-    _raw_comments_for_clustering: list[dict[str, Any]]  # 原始评论列表（供聚类使用）
-    _need_refetch: bool  # 是否需要重新爬取评论（观点簇相关性不足）
+    _posts_to_fetch: Annotated[list[str], operator.add]
+    _fetched_comment_count: int
+    _filtered_comment_count: int
+    _raw_comments_for_clustering: list[dict[str, Any]]
+    _need_refetch: bool
 
-    # ── 内部控制字段（synthesis 子图内部）
+    # ── 内部控制：synthesis
     _synthesis_round: int
     _synthesis_done: bool
-    _report_outline: dict[str, Any]          # 大纲本体
-    _outline_feedback: str                   # Observation的修改意见
+    _report_outline: dict[str, Any]
+    _outline_feedback: str
+
+    # ── 内部控制：memory/reuse
+    _reuse_strategy: str
+    _coverage_ratio: float
+    _reusable_clusters: list[dict[str, Any]]
+    _reuse_ratio: float
+    _enable_memory: bool
+    _api_type: int
+
+    # ── 错误跟踪（累加型）
+    _critical_errors: Annotated[list[dict[str, Any]], operator.add]
+    _recoverable_errors: Annotated[list[dict[str, Any]], operator.add]
+
+    # ── 关键错误终止标志
+    _abort_analysis: bool
 
 
 # ---------------------------------------------------------------------------

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, AsyncIterator
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
@@ -21,9 +21,36 @@ retry_llm = retry(
     reraise=True
 )
 
+
+@dataclass
+class ToolCall:
+    id: str
+    name: str
+    arguments: dict[str, Any]
+
+
 @dataclass
 class LLMResponse:
     content: str
+    tool_calls: list[ToolCall] | None = field(default=None)
+    finish_reason: str = "stop"
+
+
+def _parse_tool_calls(message: dict, finish_reason: str) -> list[ToolCall] | None:
+    """从 message 中解析 tool_calls，兼容 finish_reason 为 tool_calls 或 function_call。"""
+    raw = message.get("tool_calls")
+    if not raw:
+        return None
+    result = []
+    for tc in raw:
+        fn = tc.get("function", {})
+        args_raw = fn.get("arguments", "{}")
+        try:
+            args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+        except Exception:
+            args = {}
+        result.append(ToolCall(id=tc.get("id", ""), name=fn.get("name", ""), arguments=args))
+    return result or None
 
 
 class QianfanChatAdapter:
@@ -42,15 +69,22 @@ class QianfanChatAdapter:
         self.temperature = temperature
         self.timeout = timeout
 
-    async def ainvoke(self, prompt: str) -> LLMResponse:
+    async def ainvoke(
+        self,
+        prompt: str | list[dict],
+        tools: list[dict] | None = None,
+    ) -> LLMResponse:
         if not self.bearer_token:
             raise RuntimeError("缺少 QIANFAN_BEARER_TOKEN，无法调用千帆模型")
 
-        payload = {
+        messages = [{"role": "user", "content": prompt}] if isinstance(prompt, str) else prompt
+        payload: dict[str, Any] = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "temperature": self.temperature,
         }
+        if tools:
+            payload["tools"] = tools
 
         headers = {
             "Content-Type": "application/json",
@@ -62,8 +96,21 @@ class QianfanChatAdapter:
             resp.raise_for_status()
             data = resp.json()
 
-        text = self._extract_content(data)
-        return LLMResponse(content=self._normalize_text(text))
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        finish_reason = choice.get("finish_reason", "stop")
+        tool_calls = _parse_tool_calls(message, finish_reason)
+        content = message.get("content") or ""
+        if isinstance(content, list):
+            content = "".join(
+                item if isinstance(item, str) else (item.get("text") or item.get("content") or "")
+                for item in content
+            )
+        return LLMResponse(
+            content=self._normalize_text(str(content)),
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+        )
 
     @retry_llm
     async def astream(self, prompt: str) -> AsyncIterator[str]:
@@ -116,30 +163,6 @@ class QianfanChatAdapter:
                     raise e
 
     @staticmethod
-    def _extract_content(data: dict[str, Any]) -> str:
-        choices = data.get("choices") or []
-        if not choices:
-            raise RuntimeError(f"千帆返回缺少 choices: {data}")
-
-        message = choices[0].get("message") or {}
-        content = message.get("content", "")
-
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts: list[str] = []
-            for item in content:
-                if isinstance(item, str):
-                    parts.append(item)
-                elif isinstance(item, dict):
-                    text = item.get("text") or item.get("content") or ""
-                    if isinstance(text, str):
-                        parts.append(text)
-            return "".join(parts)
-
-        return str(content)
-
-    @staticmethod
     def _normalize_text(text: str) -> str:
         text = text.strip()
         if text.startswith("```json") and text.endswith("```"):
@@ -166,16 +189,23 @@ class LongcatChatAdapter:
         self.temperature = temperature
         self.timeout = timeout
 
-    async def ainvoke(self, prompt: str) -> LLMResponse:
+    async def ainvoke(
+        self,
+        prompt: str | list[dict],
+        tools: list[dict] | None = None,
+    ) -> LLMResponse:
         if not self.api_key:
             raise RuntimeError("缺少 LONGCAT_API_KEY，无法调用 Longcat 模型")
 
-        payload = {
+        messages = [{"role": "user", "content": prompt}] if isinstance(prompt, str) else prompt
+        payload: dict[str, Any] = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "temperature": self.temperature,
             "max_tokens": 4096,
         }
+        if tools:
+            payload["tools"] = tools
 
         headers = {
             "Content-Type": "application/json",
@@ -188,8 +218,16 @@ class LongcatChatAdapter:
             data = resp.json()
             logger.debug(f"[LLM] Longcat ainvoke response: {json.dumps(data, ensure_ascii=False)[:300]}...")
 
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return LLMResponse(content=self._normalize_text(content))
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message", {})
+        finish_reason = choice.get("finish_reason", "stop")
+        tool_calls = _parse_tool_calls(message, finish_reason)
+        content = message.get("content") or ""
+        return LLMResponse(
+            content=self._normalize_text(content),
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+        )
 
     @retry_llm
     async def astream(self, prompt: str) -> AsyncIterator[str]:
@@ -273,16 +311,23 @@ class ModelScopeChatAdapter:
         self.temperature = temperature
         self.timeout = timeout
 
-    async def ainvoke(self, prompt: str) -> LLMResponse:
+    async def ainvoke(
+        self,
+        prompt: str | list[dict],
+        tools: list[dict] | None = None,
+    ) -> LLMResponse:
         if not self.api_key:
             raise RuntimeError("缺少 MODELSCOPE_API_KEY，无法调用 ModelScope 模型")
 
-        payload = {
+        messages = [{"role": "user", "content": prompt}] if isinstance(prompt, str) else prompt
+        payload: dict[str, Any] = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "temperature": self.temperature,
             "max_tokens": 4096,
         }
+        if tools:
+            payload["tools"] = tools
 
         headers = {
             "Content-Type": "application/json",
@@ -295,9 +340,16 @@ class ModelScopeChatAdapter:
             data = resp.json()
             logger.debug(f"[LLM] ModelScope ainvoke response: {json.dumps(data, ensure_ascii=False)[:300]}...")
 
-        # 如果有 reasoning_content (思维链)，我们一般不需要返回给下游的 JSON 解析器，所以直接取 content
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return LLMResponse(content=self._normalize_text(content))
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message", {})
+        finish_reason = choice.get("finish_reason", "stop")
+        tool_calls = _parse_tool_calls(message, finish_reason)
+        content = message.get("content") or ""
+        return LLMResponse(
+            content=self._normalize_text(content),
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
+        )
 
     @retry_llm
     async def astream(self, prompt: str) -> AsyncIterator[str]:

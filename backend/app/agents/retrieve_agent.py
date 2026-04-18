@@ -1,15 +1,15 @@
-"""Retrieve Subgraph — 检索 ReAct Agent
-职责：接收 Orchestrator 的意图分析结果，生成小红书检索关键词，调用 MCP 工具爬取帖子，
-     观察帖子数量是否足够，不够则结合意图结果生成不重复的新关键词继续搜索。
+"""Retrieve Subgraph — Function Calling 检索 Agent
+职责：接收 Orchestrator 的意图分析结果，通过 Function Calling 让 LLM 自主决策
+     搜索关键词和工具调用，爬取小红书帖子。
 
 核心流程：
-  1. Plan Keywords: 基于 orchestrator 的 search_context 生成检索关键词
-  2. Fetch Posts: 调用 MCP 工具搜索帖子并拉取详情
-  3. Check Coverage: 检查帖子数量是否足够（>= 7 篇），决定是否需要继续搜索
+  node_retrieve_fc: LLM 接收工具定义，自主决策调用 search_posts，
+                   观察结果后决定继续搜索或结束。
 
 循环终止条件:
-  - 去重后帖子总数 >= 7 篇
+  - 去重后帖子总数 >= 目标数量（默认 7 篇）
   - 达到最大检索轮次（3 轮）
+  - LLM 主动停止调用工具
 """
 from __future__ import annotations
 
@@ -21,350 +21,95 @@ from typing import Any, Literal
 from loguru import logger
 
 from app.models.schemas import GraphState
-from app.prompts.templates import REACT_ACTION_PROMPT, RETRIEVE_EXPAND_PROMPT
-from app.tools.llm import create_llm
+from app.prompts.templates import RETRIEVE_FC_SYSTEM_PROMPT
+from app.tools.llm import ToolCall, create_llm
 from app.tools.mcp_client import XhsMcpClient, XhsMcpClientPool
+from app.tools.tool_schemas import RETRIEVE_TOOLS
 
-_llm_first = create_llm(temperature=0)
-_llm_expand = create_llm(temperature=0)
+_llm = create_llm(temperature=0)
 
-_MAX_RETRIEVE_ROUNDS = 3  # 最多 3 轮 ReAct 循环
-_MIN_POSTS = 7  # 目标最少帖子数
-_MAX_POSTS_PER_ROUND = 7  # 单轮最多新帖子
-
-
-def _parse_keywords_json(text: str) -> list[str]:
-    """清理并解析 LLM 返回的关键词 JSON 结果。"""
-    import re
-    text = re.sub(r'^```(?:json)?\s*', '', text.strip(), flags=re.MULTILINE)
-    text = re.sub(r'```\s*$', '', text.strip(), flags=re.MULTILINE).strip()
-    try:
-        data = json.loads(text)
-        # 兼容多种返回格式
-        if isinstance(data, dict):
-            return data.get("query_plan", data.get("new_keywords", data.get("new_queries", [])))
-        elif isinstance(data, list):
-            return data
-        return []
-    except Exception:
-        # 尝试提取 JSON 数组
-        m = re.search(r'\[[^\]]+\]', text)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except Exception:
-                pass
-        return []
+_MAX_RETRIEVE_ROUNDS = 3
+_MIN_POSTS = 7
+_MAX_FC_ITERATIONS = 10  # 单轮最多工具调用次数
 
 
-async def node_plan_keywords(state: GraphState, config: dict[str, Any]) -> dict[str, Any]:
-    """ReAct Plan Keywords 节点：生成检索关键词
-
-    功能：
-      - 第 1 轮：使用 REACT_ACTION_PROMPT 基于 orchestrator 的意图分析生成 3~5 个关键词
-      - 第 2+ 轮：使用 RETRIEVE_EXPAND_PROMPT，结合 search_context 生成不重复的新关键词
-    """
-    query = state.get("user_query_raw", "")
-    intent = state.get("intent", "general")
-    entities = state.get("product_entities", [])
-    aliases = state.get("aliases", [])
-    search_context = state.get("search_context", {})
-    used_keywords = state.get("_used_keywords", [])
-    retrieved_posts = state.get("retrieved_posts", [])
-    round_num = state.get("_retrieve_round", 0) + 1
-
-    # 获取记忆复用参数
-    reuse_ratio = state.get("_reuse_ratio", 0.0)
-    exclude_note_ids = state.get("_exclude_note_ids", [])
-    exclude_set = set(exclude_note_ids) if exclude_note_ids else set()
-
-    # 优先使用 workflow 传入的目标（增量模式时已计算），否则自己计算
-    target_posts = state.get("_target_posts")
-    if target_posts is None:
-        target_posts = _MIN_POSTS
-        if reuse_ratio > 0:
-            # 最多减少 80%
-            target_posts = max(3, int(_MIN_POSTS * (1 - reuse_ratio * 0.8)))
-            logger.info(f"[Retrieve] 记忆复用模式: reuse_ratio={reuse_ratio}, 目标={target_posts} 篇, 排除 {len(exclude_set)} 个历史帖子")
-    else:
-        logger.info(f"[Retrieve] 使用 workflow 传入的目标: {target_posts} 篇, 排除 {len(exclude_set)} 个历史帖子")
-
-    # 第 1 轮使用 REACT_ACTION_PROMPT，后续轮次使用 RETRIEVE_EXPAND_PROMPT
-    if round_num == 1:
-        entities_str = ",".join(entities) if entities else query
-        aliases_str = ",".join(aliases) if aliases else "无"
-        prompt = REACT_ACTION_PROMPT.format(
-            query=query,
-            intent=intent,
-            entities=entities_str,
-            aliases=aliases_str,
-        )
-        llm = _llm_first
-    else:
-        # 第 2+ 轮：使用扩展 prompt
-        prompt = RETRIEVE_EXPAND_PROMPT.format(
-            query=query,
-            intent=intent,
-            search_context=json.dumps(search_context, ensure_ascii=False),
-            used_keywords="、".join(used_keywords) if used_keywords else "无",
-            current_post_count=len(retrieved_posts),
-            target_count=target_posts,
-        )
-        llm = _llm_expand
-
-    try:
-        resp = await llm.ainvoke(prompt)
-        keywords = _parse_keywords_json(resp.content)
-
-        # 确保原始查询也在关键词列表中（第 1 轮）
-        if round_num == 1 and query not in keywords:
-            keywords.insert(0, query)
-
-        # 去重：只保留未使用过的新关键词
-        used_set = set(used_keywords)
-        new_keywords = [kw for kw in keywords if kw not in used_set]
-
-        # 更新已使用关键词列表
-        updated_used_keywords = used_keywords + new_keywords
-
-        # 设置本轮要搜索的关键词批次
-        current_batch = new_keywords[:5]  # 每轮最多 5 个关键词
-
-        logger.info(
-            f"[Retrieve][PlanKeywords] Round {round_num}: "
-            f"generated={len(keywords)}, new={len(new_keywords)}, batch={current_batch}"
-        )
-    except Exception as e:
-        logger.warning(f"[Retrieve][PlanKeywords] failed: {e}")
-        # Fallback: 使用原始查询
-        if round_num == 1:
-            current_batch = [query]
-            updated_used_keywords = used_keywords + [query]
-        else:
-            # 后续轮次 LLM 失败，尝试简单变体
-            current_batch = [f"{query} 评测", f"{query} 怎么样"]
-            updated_used_keywords = used_keywords + current_batch
-
-    return {
-        "_retrieve_round": round_num,
-        "_current_batch": current_batch,
-        "_used_keywords": updated_used_keywords,
-        "_target_posts": target_posts,
-        "_exclude_note_ids": list(exclude_set),
-    }
-
-
-async def node_fetch_posts(state: GraphState, config: dict[str, Any]) -> dict[str, Any]:
-    """ReAct Fetch Posts 节点：并发执行 MCP 检索（使用连接池）
-
-    功能：
-      - 从配置中获取连接池（大小 MCP_POOL_SIZE，默认 2）
-      - 使用连接池并发搜索帖子（每个关键词一个任务）
-      - 按 note_id 去重，新帖子追加到 retrieved_posts
-      - 对新帖子并发调用 client.fetch_post_detail(url) 拉取详情
-      - 新帖子总量上限 15 篇（单轮）
-      - search_attempts += 1
-
-    加速设计：
-      - 搜索阶段：使用连接池并发执行多个关键词搜索
-      - 详情阶段：并发拉取所有新帖子的详情
-      - 完成后连接池自动关闭，释放资源
-    """
-    current_batch = state.get("_current_batch", [])
-    existing_posts = state.get("retrieved_posts", [])
-    existing_ids = {p["note_id"] for p in existing_posts}
-
-    # 获取排除列表（来自记忆复用）
-    exclude_note_ids = state.get("_exclude_note_ids", [])
-    exclude_set = set(exclude_note_ids) if exclude_note_ids else set()
-
-    # 从 config 获取连接池和 queue
-    pool: XhsMcpClientPool = config.get("configurable", {}).get("pool")
-    queue = config.get("configurable", {}).get("queue")
-
-    # 如果没有连接池，尝试从 client 创建临时连接池
-    if not pool:
-        client: XhsMcpClient = config.get("configurable", {}).get("client")
-        if client:
-            logger.warning("[Retrieve][FetchPosts] 未找到连接池，使用单个 client 串行执行")
-            return await _fetch_posts_serial(current_batch, existing_posts, existing_ids, client, queue)
-        logger.warning("[Retrieve][FetchPosts] MCP client/pool not found in config")
-        return {"retrieved_posts": existing_posts, "search_attempts": state.get("search_attempts", 0) + 1}
-
-    new_posts: list[dict[str, Any]] = []
-    search_attempts = state.get("search_attempts", 0) + 1
-
-    # 并发搜索：每个关键词一个任务
-    async def _search_keyword(keyword: str) -> list[dict]:
-        try:
-            # 添加随机延迟（1.0~2.5 秒），模拟人类搜索行为
-            await asyncio.sleep(random.uniform(1.0, 2.5))
-            async with pool.borrow() as client:
-                posts = await client.search_posts(keyword, require_num=4)
-                logger.info(f"[Retrieve][FetchPosts] 搜索 '{keyword}' 获取 {len(posts)} 篇")
-                return posts
-        except Exception as e:
-            logger.warning(f"[Retrieve][FetchPosts] search_posts failed for '{keyword}': {e}")
-            if "登录已过期" in str(e) or "login" in str(e).lower():
-                raise RuntimeError("COOKIE_EXPIRED")
-            return []
-
-    # 执行并发搜索
-    search_tasks = [asyncio.create_task(_search_keyword(kw)) for kw in current_batch]
-    search_results = await asyncio.gather(*search_tasks, return_exceptions=True)
-
-    # 收集结果并去重，同时过滤排除列表
-    for result in search_results:
-        if isinstance(result, Exception):
-            # 检查是否是 Cookie 过期错误
-            if "COOKIE_EXPIRED" in str(result) or "登录已过期" in str(result):
-                logger.error(f"[Retrieve][FetchPosts] 检测到 Cookie 过期，终止流程")
-                raise RuntimeError("COOKIE_EXPIRED")
-            continue
-        for p in result:
-            note_id = p.get("note_id")
-            # 排除历史已分析帖子
-            if note_id in exclude_set:
-                continue
-            if note_id and note_id not in existing_ids:
-                existing_ids.add(note_id)
-                new_posts.append(p)
-                if len(new_posts) >= _MAX_POSTS_PER_ROUND:
-                    break
-        if len(new_posts) >= _MAX_POSTS_PER_ROUND:
-            break
-
-    # 记录实际排除的数量
-    if exclude_set:
-        logger.info(f"[Retrieve][FetchPosts] 过滤了 {len(exclude_set)} 个历史帖子")
-
-    if not new_posts:
-        logger.info(f"[Retrieve][FetchPosts] 无新帖子，累计 {len(existing_posts)} 篇")
-        return {"retrieved_posts": existing_posts, "search_attempts": search_attempts}
-
-    # 并发拉取详情
-    enriched = await _fetch_details_concurrent(new_posts, pool, queue)
-
-    combined = existing_posts + enriched
-    logger.info(f"[Retrieve][FetchPosts] 本轮获取 {len(enriched)} 篇，累计 {len(combined)} 篇")
-
-    return {
-        "retrieved_posts": combined,
-        "search_attempts": search_attempts,
-    }
-
-
-async def _fetch_posts_serial(
-    current_batch: list[str],
-    existing_posts: list[dict],
+async def _execute_retrieve_tool(
+    tc: ToolCall,
+    pool: XhsMcpClientPool,
     existing_ids: set[str],
-    client: XhsMcpClient,
-    queue
+    exclude_set: set[str],
+    new_posts: list[dict],
+    new_keywords: list[str],
 ) -> dict[str, Any]:
-    """串行版本（向后兼容）：当没有连接池时使用。"""
-    new_posts: list[dict[str, Any]] = []
-    search_attempts = 1
+    """执行单个工具调用，返回结果供 LLM 继续推理。"""
+    if tc.name == "search_posts":
+        keyword = tc.arguments.get("keyword", "")
+        require_num = int(tc.arguments.get("require_num", 5))
 
-    for keyword in current_batch:
-        logger.info(f"[Retrieve][FetchPosts] 搜索：{keyword}")
+        if keyword and keyword not in new_keywords:
+            new_keywords.append(keyword)
+
         try:
-            posts = await client.search_posts(keyword, require_num=5)
+            async with pool.borrow() as client:
+                posts = await client.search_posts(keyword, require_num=require_num)
+
+            added = 0
+            for p in posts:
+                note_id = p.get("note_id")
+                if note_id and note_id not in existing_ids and note_id not in exclude_set:
+                    existing_ids.add(note_id)
+                    new_posts.append(p)
+                    added += 1
+
+            logger.info(f"[Retrieve][FC] search_posts '{keyword}': found={len(posts)}, new_added={added}")
+            return {"status": "ok", "keyword": keyword, "found": len(posts), "new_added": added}
         except Exception as e:
-            logger.warning(f"[Retrieve][FetchPosts] search_posts failed for '{keyword}': {e}")
+            logger.warning(f"[Retrieve][FC] search_posts failed '{keyword}': {e}")
             if "登录已过期" in str(e) or "login" in str(e).lower():
                 raise RuntimeError("COOKIE_EXPIRED")
-            continue
+            return {"status": "error", "error": str(e)}
 
-        for p in posts:
-            note_id = p.get("note_id")
-            if note_id and note_id not in existing_ids:
-                existing_ids.add(note_id)
-                new_posts.append(p)
-                if len(new_posts) >= _MAX_POSTS_PER_ROUND:
-                    break
-        if len(new_posts) >= _MAX_POSTS_PER_ROUND:
-            break
-
-    if not new_posts:
-        logger.info(f"[Retrieve][FetchPosts] 无新帖子，累计 {len(existing_posts)} 篇")
-        return {"retrieved_posts": existing_posts, "search_attempts": search_attempts}
-
-    # 逐篇拉取详情
-    enriched: list[dict] = []
-    total = len(new_posts)
-    for i, post in enumerate(new_posts):
-        try:
-            url = post.get("note_url")
-            if url:
-                detail = await client.fetch_post_detail(url)
-                merged = {**post, **detail}
-            else:
-                merged = post
-        except Exception as e:
-            logger.warning(f"[Retrieve][FetchPosts] fetch detail failed {post.get('note_id')}: {e}")
-            merged = post
-        enriched.append(merged)
-
-        # 推送进度事件
-        if queue is not None:
-            title = merged.get("title") or merged.get("desc", "")[:20] or f"帖子 {i + 1}"
-            queue.put_nowait({
-                "event": "post_reading",
-                "data": {"index": i + 1, "total": total, "title": title},
-            })
-
-    combined = existing_posts + enriched
-    logger.info(f"[Retrieve][FetchPosts] 本轮获取 {len(enriched)} 篇，累计 {len(combined)} 篇")
-
-    return {
-        "retrieved_posts": combined,
-        "search_attempts": search_attempts,
-    }
+    return {"status": "unknown_tool", "name": tc.name}
 
 
 async def _fetch_details_concurrent(
     new_posts: list[dict],
     pool: XhsMcpClientPool,
-    queue
+    queue,
 ) -> list[dict]:
     """并发拉取帖子详情。"""
     enriched: list[dict] = []
     total = len(new_posts)
 
-    async def _fetch_detail(post: dict, index: int) -> dict | None:
+    async def _fetch_one(post: dict, index: int) -> dict | None:
         try:
             url = post.get("note_url")
             if url:
-                # 添加随机延迟（0.5~1.5 秒）
                 await asyncio.sleep(random.uniform(0.5, 1.5))
                 async with pool.borrow() as client:
                     detail = await client.fetch_post_detail(url)
                     merged = {**post, **detail}
-                logger.info(f"[Retrieve][FetchDetails] {index + 1}/{total}: {merged.get('title', '无标题')[:20]}")
+                logger.info(f"[Retrieve][FC] detail {index+1}/{total}: {merged.get('title', '')[:20]}")
                 return merged
             return post
         except Exception as e:
-            logger.warning(f"[Retrieve][FetchDetails] fetch detail failed {post.get('note_id')}: {e}")
+            logger.warning(f"[Retrieve][FC] fetch detail failed {post.get('note_id')}: {e}")
             return post
 
-    # 并发拉取详情（使用连接池，自动限流）
-    detail_tasks = [asyncio.create_task(_fetch_detail(p, i)) for i, p in enumerate(new_posts)]
-    results = await asyncio.gather(*detail_tasks, return_exceptions=True)
+    tasks = [asyncio.create_task(_fetch_one(p, i)) for i, p in enumerate(new_posts)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
     for i, result in enumerate(results):
         if isinstance(result, Exception):
-            # 检查是否是 Cookie 过期错误
             if "COOKIE_EXPIRED" in str(result) or "登录已过期" in str(result):
-                logger.error(f"[Retrieve][FetchDetails] 检测到 Cookie 过期，终止流程")
                 raise RuntimeError("COOKIE_EXPIRED")
             enriched.append(new_posts[i])
         elif result is not None:
             enriched.append(result)
 
-        # 推送进度事件
         if queue is not None:
             merged = enriched[-1] if enriched else new_posts[i]
-            title = merged.get("title") or merged.get("desc", "")[:20] or f"帖子 {i + 1}"
+            title = merged.get("title") or merged.get("desc", "")[:20] or f"帖子 {i+1}"
             queue.put_nowait({
                 "event": "post_reading",
                 "data": {"index": i + 1, "total": total, "title": title},
@@ -373,71 +118,237 @@ async def _fetch_details_concurrent(
     return enriched
 
 
-async def node_check_coverage(state: GraphState) -> dict[str, Any]:
-    """ReAct Check Coverage 节点：观察帖子数量
+async def node_retrieve_fc(state: GraphState, config: dict[str, Any]) -> dict[str, Any]:
+    """Function Calling 版检索节点：LLM 自主决策搜索关键词和工具调用。
 
-    功能：
-      - 检查 retrieved_posts 数量是否 >= 动态目标（支持记忆复用调整）
-      - 检查是否达到最大轮次 _MAX_RETRIEVE_ROUNDS
-      - 决定是否需要继续搜索
-
-    注意：
-      - 此节点只评估帖子数量，不评估帖子质量
-      - 帖子质量评估由 Screen Agent 负责
+    LLM 接收工具定义（search_posts），在多轮对话中自主决策：
+    1. 生成关键词并调用 search_posts
+    2. 观察搜索结果，判断是否继续
+    3. 帖子数量足够时停止调用工具
     """
-    total = len(state.get("retrieved_posts", []))
-    round_num = state.get("_retrieve_round", 0)
+    query = state.get("user_query_raw", "")
+    intent = state.get("intent", "general")
+    entities = state.get("product_entities", [])
+    aliases = state.get("aliases", [])
+    search_context = state.get("search_context", {})
+    retrieved_posts = state.get("retrieved_posts", [])
+    used_keywords = state.get("_used_keywords", [])
+    round_num = state.get("_retrieve_round", 0) + 1
+    reuse_ratio = state.get("_reuse_ratio", 0.0)
+    exclude_note_ids = state.get("_exclude_note_ids", [])
 
-    # 获取动态目标（记忆复用时可能减少）
-    target_posts = state.get("_target_posts", _MIN_POSTS)
+    pool: XhsMcpClientPool = config.get("configurable", {}).get("pool")
+    queue = config.get("configurable", {}).get("queue")
+    api_type = config.get("configurable", {}).get("api_type", 2)
 
-    # 计算覆盖率分数
-    coverage_score = min(total / target_posts, 1.0) if target_posts > 0 else 1.0
+    # 计算目标帖子数
+    target_posts = state.get("_target_posts") or None
+    if target_posts is None:
+        target_posts = _MIN_POSTS
+        if reuse_ratio > 0:
+            target_posts = max(3, int(_MIN_POSTS * (1 - reuse_ratio * 0.8)))
+            logger.info(f"[Retrieve][FC] 记忆复用: reuse_ratio={reuse_ratio}, 目标={target_posts}")
+    else:
+        logger.info(f"[Retrieve][FC] workflow 传入目标: {target_posts}")
 
-    # 终止条件：数量够了 或 达到最大轮次
-    should_stop = total >= target_posts or round_num >= _MAX_RETRIEVE_ROUNDS
+    if not pool:
+        client: XhsMcpClient = config.get("configurable", {}).get("client")
+        if not client:
+            logger.warning("[Retrieve][FC] MCP client/pool not found")
+            return {
+                "retrieved_posts": [],
+                "_retrieve_round": round_num,
+                "_retrieve_done": True,
+                "_target_posts": target_posts,
+                "search_attempts": state.get("search_attempts", 0) + 1,
+            }
+
+    system_prompt = RETRIEVE_FC_SYSTEM_PROMPT.format(
+        query=query,
+        intent=intent,
+        entities=",".join(entities) if entities else query,
+        aliases=",".join(aliases) if aliases else "无",
+        search_context=json.dumps(search_context, ensure_ascii=False),
+        used_keywords="、".join(used_keywords) if used_keywords else "无",
+        current_count=len(retrieved_posts),
+        target_count=target_posts,
+    )
+
+    messages: list[dict] = [{"role": "user", "content": system_prompt}]
+    new_posts: list[dict] = []
+    new_keywords: list[str] = []
+    existing_ids = {p["note_id"] for p in retrieved_posts if p.get("note_id")}
+    exclude_set = set(exclude_note_ids)
+
+    # Function Calling 多轮循环
+    for iteration in range(_MAX_FC_ITERATIONS):
+        try:
+            resp = await _llm.ainvoke(messages, tools=RETRIEVE_TOOLS)
+        except Exception as e:
+            logger.warning(f"[Retrieve][FC] LLM 调用失败 iteration={iteration}: {e}")
+            break
+
+        # LLM 决定结束（无工具调用）
+        if resp.finish_reason != "tool_calls" or not resp.tool_calls:
+            logger.info(f"[Retrieve][FC] LLM 停止调用工具，iteration={iteration}")
+            break
+
+        # 将 assistant 消息加入对话历史
+        messages.append({
+            "role": "assistant",
+            "content": resp.content or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.name, "arguments": json.dumps(tc.arguments, ensure_ascii=False)},
+                }
+                for tc in resp.tool_calls
+            ],
+        })
+
+        # 执行工具调用
+        tool_results = []
+        for tc in resp.tool_calls:
+            result = await _execute_retrieve_tool(
+                tc, pool, existing_ids, exclude_set, new_posts, new_keywords
+            )
+            tool_results.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": json.dumps(result, ensure_ascii=False),
+            })
+
+        messages.extend(tool_results)
+
+        # 检查是否已达到目标
+        total = len(retrieved_posts) + len(new_posts)
+        if total >= target_posts:
+            logger.info(f"[Retrieve][FC] 已达到目标 {target_posts} 篇，停止")
+            break
+
+        # 关键词间延迟（第一次不延迟）
+        if iteration > 0:
+            await asyncio.sleep(random.uniform(2.0, 4.0))
+
+    # 拉取详情
+    if api_type == 2 and new_posts:
+        enriched = await _fetch_details_concurrent(new_posts, pool, queue)
+    else:
+        if api_type == 1:
+            logger.info(f"[Retrieve][FC] api_type=1: 跳过详情拉取，保留 {len(new_posts)} 篇基本信息")
+        enriched = new_posts
+
+    total_after = len(retrieved_posts) + len(enriched)
+    coverage_score = min(total_after / target_posts, 1.0) if target_posts > 0 else 1.0
+    retrieve_done = total_after >= target_posts or round_num >= _MAX_RETRIEVE_ROUNDS
+
+    # 检查关键错误：重试后仍然没有任何帖子
+    critical_errors = []
+    abort_analysis = False
+    if total_after == 0:
+        critical_errors.append({
+            "stage": "retrieve",
+            "error_type": "zero_posts",
+            "message": "所有关键词搜索都失败或返回空结果",
+            "keywords_tried": new_keywords,
+            "search_attempts": state.get("search_attempts", 0) + 1,
+        })
+        abort_analysis = True
+        logger.error(f"[Retrieve][FC] 关键错误: 无法获取任何帖子")
 
     logger.info(
-        f"[Retrieve][CheckCoverage] Round {round_num}: "
-        f"posts={total}, target={target_posts}, coverage={coverage_score:.2f}, stop={should_stop}"
+        f"[Retrieve][FC] Round {round_num}: new={len(enriched)}, total={total_after}, "
+        f"coverage={coverage_score:.2f}, done={retrieve_done}"
     )
 
     return {
-        "_retrieve_done": should_stop,
+        "retrieved_posts": enriched,
+        "_used_keywords": new_keywords,
+        "_retrieve_round": round_num,
+        "_retrieve_done": retrieve_done,
+        "_target_posts": target_posts,
+        "_exclude_note_ids": list(exclude_set),
         "retrieval_coverage_score": coverage_score,
+        "search_attempts": state.get("search_attempts", 0) + 1,
+        "_critical_errors": critical_errors,
+        "_abort_analysis": abort_analysis,
     }
 
 
-def _route_coverage(state: GraphState) -> Literal["plan_keywords", "__end__"]:
-    """条件边：根据覆盖率检查结果决定是否继续循环"""
+def _route_coverage(state: GraphState) -> Literal["retrieve_fc", "__end__"]:
     if state.get("_retrieve_done"):
         return "__end__"
-    return "plan_keywords"
+    return "retrieve_fc"
+
+
+async def node_error_report(state: GraphState) -> dict[str, Any]:
+    """生成错误报告并终止分析。"""
+    critical_errors = state.get("_critical_errors", [])
+    error_report = _generate_error_report(critical_errors)
+    logger.info("[Retrieve][ErrorReport] 生成错误报告，终止分析")
+
+    return {
+        "final_answer": error_report,
+        "confidence_score": 0.0,
+        "limitations": ["系统错误导致无法完成分析"],
+        "_retrieve_done": True,
+        "_analyze_done": True,
+    }
+
+
+def _generate_error_report(critical_errors: list[dict]) -> str:
+    """生成用户友好的错误报告。"""
+    sections = []
+    sections.append("# ⚠️ 分析失败报告\n\n")
+    sections.append("很抱歉，系统在分析过程中遇到了关键错误，无法完成分析。\n\n")
+
+    retrieve_errors = [e for e in critical_errors if e.get("stage") == "retrieve"]
+    analyze_errors = [e for e in critical_errors if e.get("stage") == "analyze"]
+
+    if retrieve_errors:
+        sections.append("## 检索阶段错误\n\n")
+        for err in retrieve_errors:
+            if err.get("error_type") == "zero_posts":
+                sections.append("- **无法获取帖子**: 所有关键词搜索都失败或返回空结果\n")
+                keywords = err.get("keywords_tried", [])
+                if keywords:
+                    sections.append(f"  - 尝试关键词: {', '.join(keywords)}\n")
+
+    if analyze_errors:
+        sections.append("## 分析阶段错误\n\n")
+        for err in analyze_errors:
+            if err.get("error_type") == "no_data":
+                sections.append(f"- **无法获取内容**: 找到{err.get('posts_count', 0)}篇帖子，但评论爬取全部失败且帖子正文为空\n")
+
+    sections.append("\n## 建议\n\n")
+    sections.append("1. 检查小红书Cookie是否过期\n")
+    sections.append("2. 检查网络连接是否正常\n")
+    sections.append("3. 稍后重试\n")
+
+    return "".join(sections)
 
 
 def build_retrieve_graph():
-    """构建检索 ReAct 子图
-
-    完整 ReAct 循环：
-      plan_keywords -> fetch_posts -> check_coverage
-    """
-    from langgraph.graph import StateGraph
+    """构建 Function Calling 版检索子图。"""
+    from langgraph.graph import StateGraph, END
 
     g = StateGraph(GraphState)
+    g.add_node("retrieve_fc", node_retrieve_fc)
+    g.add_node("error_report", node_error_report)
 
-    # 添加所有节点
-    g.add_node("plan_keywords", node_plan_keywords)
-    g.add_node("fetch_posts", node_fetch_posts)
-    g.add_node("check_coverage", node_check_coverage)
-
-    # 设置入口点
-    g.set_entry_point("plan_keywords")
-
-    # 设置边连接
-    g.add_edge("plan_keywords", "fetch_posts")
-    g.add_edge("fetch_posts", "check_coverage")
-
-    # 添加条件边：根据 Check Coverage 结果决定是否循环
-    g.add_conditional_edges("check_coverage", _route_coverage)
+    g.set_entry_point("retrieve_fc")
+    # 关键错误时跳到 error_report，否则正常循环
+    g.add_conditional_edges("retrieve_fc", _route_after_retrieve)
+    g.add_edge("error_report", END)
 
     return g.compile()
+
+
+def _route_after_retrieve(state: GraphState) -> Literal["error_report", "retrieve_fc", "__end__"]:
+    """关键错误时直接跳到错误报告节点。"""
+    if state.get("_abort_analysis"):
+        return "error_report"
+    if state.get("_retrieve_done"):
+        return "__end__"
+    return "retrieve_fc"

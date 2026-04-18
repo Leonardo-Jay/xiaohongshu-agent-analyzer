@@ -2,30 +2,35 @@ import json
 import math
 import os
 import random
-import subprocess
-import sys
 import execjs
 from xhs_utils.cookie_util import trans_cookies
 
+# 获取 static 目录的绝对路径
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'static')
-_RUNNER = os.path.join(_STATIC_DIR, 'xhs_sign_runner.js')
 
-def _read_js(filename):
-    """Read JS file and replace non-ASCII lookalike chars that break execjs on Windows."""
-    content = open(os.path.join(_STATIC_DIR, filename), 'r', encoding='utf-8').read()
-    content = content.replace('\u0399', 'I')
+
+def _load_js_file(filename):
+    """加载 JS 文件，使用绝对路径"""
+    filepath = os.path.join(_STATIC_DIR, filename)
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return f.read()
+
+
+def _load_xray_js():
+    """加载 xhs_xray.js，并将相对路径替换为绝对路径"""
+    content = _load_js_file('xhs_xray.js')
+    # 将相对路径的 require 替换为绝对路径
+    content = content.replace("require('./xhs_xray_pack1.js')", f"require({repr(os.path.join(_STATIC_DIR, 'xhs_xray_pack1.js'))})")
+    content = content.replace("require('./xhs_xray_pack2.js')", f"require({repr(os.path.join(_STATIC_DIR, 'xhs_xray_pack2.js'))})")
+    content = content.replace("require('./static/xhs_xray_pack1.js')", f"require({repr(os.path.join(_STATIC_DIR, 'xhs_xray_pack1.js'))})")
+    content = content.replace("require('./static/xhs_xray_pack2.js')", f"require({repr(os.path.join(_STATIC_DIR, 'xhs_xray_pack2.js'))})")
+    content = content.replace("require('../static/xhs_xray_pack1.js')", f"require({repr(os.path.join(_STATIC_DIR, 'xhs_xray_pack1.js'))})")
+    content = content.replace("require('../static/xhs_xray_pack2.js')", f"require({repr(os.path.join(_STATIC_DIR, 'xhs_xray_pack2.js'))})")
     return content
 
-def _load_js(filename):
-    content = _read_js(filename)
-    # 把 xhs_xray.js 里的相对路径 require 替换为绝对路径，避免 execjs cwd 不是 static 目录时找不到文件
-    content = content.replace("require('./xhs_xray_pack1.js')", f"require({repr(_STATIC_DIR + '/xhs_xray_pack1.js')})")
-    content = content.replace("require('./xhs_xray_pack2.js')", f"require({repr(_STATIC_DIR + '/xhs_xray_pack2.js')})")
-    return execjs.compile(content)
 
-xray_js = _load_js('xhs_xray.js')
-
-_node_lock = __import__('threading').Lock()
+js = execjs.compile(_load_js_file('xhs_main_260411.js'))
+xray_js = execjs.compile(_load_xray_js())
 
 def generate_x_b3_traceid(len=16):
     x_b3_traceid = ""
@@ -34,24 +39,9 @@ def generate_x_b3_traceid(len=16):
     return x_b3_traceid
 
 def generate_xs_xs_common(a1, api, data='', method='POST'):
-    payload = json.dumps({'api': api, 'data': data or '', 'a1': a1, 'method': method or 'POST'})
-    with _node_lock:
-        result = subprocess.run(
-            ['node', _RUNNER],
-            input=payload.encode('utf-8'),
-            capture_output=True,
-            timeout=30,
-            cwd=os.path.dirname(_RUNNER),
-            start_new_session=True,
-        )
-    # stdout 可能含有 [Error] 等非 JSON 行，找第一个以 { 开头的行
-    stdout_text = result.stdout.decode('utf-8', errors='replace')
-    json_line = next((l for l in stdout_text.splitlines() if l.strip().startswith('{')), None)
-    if result.returncode != 0 or not json_line:
-        stderr = result.stderr.decode('utf-8', errors='replace').strip() or stdout_text.strip() or '(无输出)'
-        raise RuntimeError(f'xhs_sign_runner.js 失败 (exit={result.returncode}): {stderr}')
-    ret = json.loads(json_line)
-    return ret['xs'], ret['xt'], ret['xs_common']
+    ret = js.call('get_request_headers_params', api, data, a1, method)
+    xs, xt, xs_common = ret['xs'], ret['xt'], ret['xs_common']
+    return xs, xt, xs_common
 
 def generate_xs(a1, api, data=''):
     ret = js.call('get_xs', api, data, a1)

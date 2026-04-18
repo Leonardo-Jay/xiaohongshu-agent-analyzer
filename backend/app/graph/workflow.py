@@ -4,8 +4,8 @@
   1. orchestrator_subgraph（内部 ReAct 循环）
      - 意图识别，输出 intent, key_aspects, user_needs, search_context 等
 
-  2. retrieve_subgraph（内部 ReAct 循环）
-     - plan_keywords → fetch_posts → check_coverage
+  2. retrieve_subgraph（Function Calling 循环）
+     - retrieve_fc（LLM 自主决策调用 search_posts）
      - 基于 orchestrator 的 search_context 生成关键词，搜索帖子
      - 目标: >= 7 篇帖子，最多 3 轮循环
      - MCP 连接池固定 1 个（避免并发爬取导致封号）
@@ -15,8 +15,8 @@
      - 使用 orchestrator 的 key_aspects、user_needs 进行相关性筛选
      - 过滤广告/软广，输出 screened_items
 
-  4. analyze_subgraph（内部 ReAct 循环）
-     - select_posts → fetch_comments → cluster_opinions → validate_clusters → check_quality
+  4. analyze_subgraph（Function Calling 循环）
+     - fetch_comments_fc（LLM 自主决策调用 search_comments）→ cluster_opinions → validate_clusters → check_quality
      - 选择帖子爬取评论，过滤无效评论，观点聚类
      - 循环终止条件: 评论>=50且冲突观点 / 评论>=40且观点簇>=5 / 达到2轮上限
      - 每轮爬取 3 篇帖子的评论，MCP 连接池大小跟随 MCP_POOL_SIZE 环境变量
@@ -112,6 +112,12 @@ async def run_analysis(
         "_filtered_comment_count": 0,
         "_need_refetch": False,
         "_enable_memory": enable_memory if enable_memory is not None else (os.getenv("ENABLE_MEMORY", "false").lower() == "true"),
+        "_api_type": int(os.getenv("XHS_API_TYPE", "2")),
+        "_reuse_strategy": "",
+        "_coverage_ratio": 0.0,
+        "_reusable_clusters": [],
+        "_reuse_ratio": 0.0,
+        "_exclude_note_ids": [],
         # 其他阶段
         "screened_items": [],
         "screening_stats": {},
@@ -323,6 +329,8 @@ async def run_analysis(
 
         else:
             # 增量更新或从头开始：执行 Retrieve/Screen/Analyze
+            api_type = int(os.getenv("XHS_API_TYPE", "2"))  # 默认为 2
+
             # ── 2. Retrieve Subgraph ──
             if reuse_decision and reuse_decision.reuse_strategy == "incremental":
                 # 增量模式：缩减爬取量
@@ -336,8 +344,9 @@ async def run_analysis(
                 _progress(queue, "retrieve", "正在检索相关帖子...", 25)
 
             # 执行检索（固定使用 1 个连接，避免并发爬取导致封号）
+            # 传入 api_type：当 api_type=1 时跳过详情拉取，后续用 apihz.cn 补全
             async with XhsMcpClientPool(size=1, cookie=cookie) as retrieve_pool:
-                config = {"configurable": {"pool": retrieve_pool, "queue": queue}}
+                config = {"configurable": {"pool": retrieve_pool, "queue": queue, "api_type": api_type}}
                 retrieve_output = await _retrieve_app.ainvoke(state, config=config)
             state = {**state, **retrieve_output}
             logger.info(
@@ -346,6 +355,31 @@ async def run_analysis(
                 f"coverage={state.get('retrieval_coverage_score', 0.0):.2f}"
             )
             _progress(queue, "retrieve", f"检索到 {len(state.get('retrieved_posts', []))} 篇帖子", 28)
+
+            # ── apihz.cn 补全正文（仅 api_type=1，在 Screen 之前！）──
+            if api_type == 1:
+                _progress(queue, "retrieve", "正在获取完整帖子正文...", 30)
+                try:
+                    from app.tools.xhs_apihz import fetch_posts_detail_batch, is_apihz_configured
+
+                    if not is_apihz_configured():
+                        logger.warning("[Workflow] apihz.cn 未配置，使用截断的帖子正文")
+                    else:
+                        retrieved_posts = state.get("retrieved_posts", [])
+                        note_urls = [p.get("note_url", "") for p in retrieved_posts]
+                        full_details = await fetch_posts_detail_batch(note_urls)
+
+                        # 更新 retrieved_posts 中的 desc 为完整正文
+                        detail_map = {d.get("note_id"): d for d in full_details if d.get("note_id")}
+                        for post in retrieved_posts:
+                            note_id = post.get("note_id")
+                            if note_id in detail_map:
+                                post["desc"] = detail_map[note_id].get("desc", post.get("desc", ""))
+                                post["title"] = detail_map[note_id].get("title", post.get("title", ""))
+
+                        logger.info(f"[Workflow] apihz.cn 获取了 {len(full_details)} 篇帖子的完整正文")
+                except Exception as e:
+                    logger.warning(f"[Workflow] apihz.cn 调用失败: {e}，使用截断的帖子正文")
 
             # ── 3. Screen Subgraph ──
             _progress(queue, "screen", "正在筛选相关帖子（过滤广告/软广）...", 35)
@@ -380,12 +414,21 @@ async def run_analysis(
             logger.info(f"[Workflow][Screen] {screen_msg}")
 
             # ── 4. Analyze ──
-            _progress(queue, "analyze", "正在获取评论并分析舆情（最长约 1 分钟）...", 56)
-            pool_size = int(os.getenv("MCP_POOL_SIZE", "2"))
-            pool_size = max(1, min(pool_size, len(state.get("screened_items", [])) or 1))
-            async with XhsMcpClientPool(size=pool_size, cookie=cookie) as pool:
-                config = {"configurable": {"pool": pool, "queue": queue}}
+            # 注意：api_type=1 时，正文已在 Retrieve 后通过 apihz.cn 补全
+            if api_type == 1:
+                # 跳过评论爬取模式：直接使用帖子正文进行聚类
+                _progress(queue, "analyze", "使用帖子正文进行观点分析...", 56)
+                logger.info(f"[Workflow][Analyze] api_type=1: 使用 {len(screened)} 篇帖子正文进行聚类")
+                config = {"configurable": {"queue": queue, "api_type": 1}}
                 analyze_output = await _analyze_app.ainvoke(state, config=config)
+            else:
+                # 正常模式：爬取评论
+                _progress(queue, "analyze", "正在获取评论并分析舆情（最长约 1 分钟）...", 56)
+                pool_size = int(os.getenv("MCP_POOL_SIZE", "1"))
+                pool_size = max(1, min(pool_size, len(state.get("screened_items", [])) or 1))
+                async with XhsMcpClientPool(size=pool_size, cookie=cookie) as pool:
+                    config = {"configurable": {"pool": pool, "queue": queue, "api_type": 2}}
+                    analyze_output = await _analyze_app.ainvoke(state, config=config)
             state = {**state, **analyze_output}
 
             # 构建详细的分析消息
@@ -393,7 +436,10 @@ async def run_analysis(
             cluster_count = len(state.get("clusters", []))
             filtered_comment_count = state.get("_filtered_comment_count", 0)
 
-            analyze_msg = f"已分析 {comment_count} 条评论，生成 {cluster_count} 个观点簇"
+            if api_type == 1:
+                analyze_msg = f"已分析 {comment_count} 篇帖子正文，生成 {cluster_count} 个观点簇"
+            else:
+                analyze_msg = f"已分析 {comment_count} 条评论，生成 {cluster_count} 个观点簇"
             if filtered_comment_count > 0:
                 analyze_msg += f"，过滤 {filtered_comment_count} 条无效评论"
 
@@ -405,9 +451,7 @@ async def run_analysis(
         config = {"configurable": {"queue": queue}}
         synthesis_output = await _synthesis_app.ainvoke(state, config=config)
 
-        # 防御性确保合并数据字典不出错
-        for k, v in synthesis_output.items():
-            state[k] = v
+        state = {**state, **synthesis_output}
         _progress(queue, "synthesize", "报告生成完毕", 97)
 
         # ── 集成到实体记忆（Ingest 操作）──
