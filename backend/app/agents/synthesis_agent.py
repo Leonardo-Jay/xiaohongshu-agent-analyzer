@@ -23,7 +23,7 @@ from app.tools.llm import create_llm
 _llm_plan = create_llm(temperature=0.1)
 _llm_report = create_llm(temperature=0.3)
 
-_MAX_SYNTHESIS_ROUNDS = 2
+_MAX_SYNTHESIS_ROUNDS = 3
 
 def _strip_fences(text: str) -> str:
     """去除 LLM 报告输出中可能加的 markdown/代码围栏。"""
@@ -123,6 +123,32 @@ async def node_observe_outline(state: GraphState) -> dict[str, Any]:
     structure = outline.get("report_strategy", {}).get("structure", [])
     if not structure:
         return {"_synthesis_done": False, "_outline_feedback": "大纲中缺少 structure 结构部分。"}
+
+    # ── 新增：检查末章必须存在 ──
+    if len(structure) >= 1:
+        last_chapter = structure[-1].get("chapter", "")
+        if not last_chapter or ("总结" not in last_chapter and "综合建议" not in last_chapter):
+            return {
+                "_synthesis_done": False,
+                "_outline_feedback": f"末章必须命名为「总结」或「综合建议」，当前末章名称：「{last_chapter}」"
+            }
+
+    # ── 新增：检查中间章节数量 ──
+    if len(structure) >= 3:
+        middle_chapter_count = len(structure) - 2  # 排除首章和末章
+        if middle_chapter_count < 2:
+            feedback = f"中间章节必须有 2~3 个，当前只有 {middle_chapter_count} 个。"
+            if middle_chapter_count == 1:
+                feedback += "\n建议：将当前唯一的中间章节拆分为2个独立的章节，分别从不同角度分析观点。"
+            return {
+                "_synthesis_done": False,
+                "_outline_feedback": feedback
+            }
+        elif middle_chapter_count > 3:
+            return {
+                "_synthesis_done": False,
+                "_outline_feedback": f"中间章节过多（{middle_chapter_count}个），建议合并为2~3个核心章节。"
+            }
 
     # ── 标记章节状态 ──
     chapter_issues = {}  # {章节名: [问题列表]}

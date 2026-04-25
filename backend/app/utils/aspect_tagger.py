@@ -7,11 +7,75 @@
 - 用 LLM 的语言理解能力替代 embedding 的语义搜索
 """
 import json
+import re
 from typing import Any
 
 from loguru import logger
 
 from app.tools.llm import create_llm
+
+
+def extract_json(text: str) -> dict:
+    """
+    从LLM响应中提取JSON对象（容错版本）
+
+    处理以下情况：
+    1. 纯JSON
+    2. JSON被markdown代码块包裹（```json...```）
+    3. JSON之后有额外文字（Extra data问题）
+    4. 嵌套JSON对象
+
+    Args:
+        text: LLM返回的原始文本
+
+    Returns:
+        解析后的字典对象
+
+    Raises:
+        ValueError: 无法提取有效JSON对象
+    """
+    # 步骤1：尝试直接解析
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # 步骤2：尝试去除markdown代码块后解析
+    cleaned_text = text.strip()
+    if cleaned_text.startswith("```"):
+        # 去除开头的 ```json 或 ```
+        cleaned_text = cleaned_text.split("\n", 1)[1] if "\n" in cleaned_text else cleaned_text[3:]
+    if cleaned_text.endswith("```"):
+        cleaned_text = cleaned_text.rsplit("\n", 1)[0]
+
+    try:
+        return json.loads(cleaned_text)
+    except json.JSONDecodeError:
+        pass
+
+    # 步骤3：尝试提取第一个完整的JSON对象（处理Extra data问题）
+    # 使用花括号计数法找到最外层的完整JSON对象
+    brace_count = 0
+    start_idx = None
+    for i, char in enumerate(cleaned_text):
+        if char == '{':
+            if start_idx is None:
+                start_idx = i
+            brace_count += 1
+        elif char == '}':
+            brace_count -= 1
+            if brace_count == 0 and start_idx is not None:
+                json_str = cleaned_text[start_idx:i+1]
+                try:
+                    result = json.loads(json_str)
+                    logger.debug(f"[AspectTagger] 成功提取JSON对象（长度: {len(json_str)} 字符）")
+                    return result
+                except json.JSONDecodeError as e:
+                    logger.debug(f"[AspectTagger] 提取的JSON片段解析失败: {e}")
+                    break
+
+    # 步骤4：所有方法都失败，抛出异常
+    raise ValueError(f"无法从响应中提取有效的JSON对象。响应前100字符: {text[:100]}")
 
 
 class AspectTagger:
@@ -52,13 +116,8 @@ class AspectTagger:
             # 调试：打印 LLM 原始响应
             logger.debug(f"[AspectTagger] LLM 原始响应: {result_text[:500]}")
 
-            # 解析 JSON 响应
-            if result_text.startswith("```"):
-                result_text = result_text.split("\n", 1)[1]
-            if result_text.endswith("```"):
-                result_text = result_text.rsplit("\n", 1)[0]
-
-            result = json.loads(result_text)
+            # 解析 JSON 响应（使用容错版本）
+            result = extract_json(result_text)
 
             # 调试：打印解析后的结果
             logger.debug(f"[AspectTagger] 解析后的 JSON: {result}")

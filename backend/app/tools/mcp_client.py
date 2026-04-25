@@ -16,10 +16,12 @@ import json
 import os
 import subprocess
 import sys
+import time
 import traceback
 from contextlib import asynccontextmanager
 from typing import Any
 
+import psutil
 from loguru import logger
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -91,6 +93,7 @@ class XhsMcpClient:
         self._cm = None
         self._cookie = cookie
         self._is_mock = (self._cookie == "-1" or os.environ.get("XHS_COOKIES") == "-1")
+        self._child_pids_before: set[int] = set()  # 记录启动前的子进程 PID
 
     async def __aenter__(self) -> "XhsMcpClient":
         if self._is_mock:
@@ -98,6 +101,13 @@ class XhsMcpClient:
             return self
         # 预检：只执行一次（并发安全）
         await _ensure_preflight()
+
+        # 记录启动前的子进程 PID
+        try:
+            parent = psutil.Process(os.getpid())
+            self._child_pids_before = {p.pid for p in parent.children(recursive=False)}
+        except Exception:
+            self._child_pids_before = set()
 
         env = dict(os.environ)
         if self._cookie:
@@ -121,16 +131,53 @@ class XhsMcpClient:
         return self
 
     async def __aexit__(self, *exc):
+        # 1. 关闭 session
         if self._session:
             try:
                 await self._session.__aexit__(*exc)
             except Exception:
                 pass
+
+        # 2. 关闭 stdio_client（会关闭管道）
         if self._cm:
             try:
                 await self._cm.__aexit__(*exc)
             except Exception:
                 pass
+
+        # 3. 显式杀死 MCP 子进程
+        await self._kill_mcp_subprocess()
+
+    async def _kill_mcp_subprocess(self):
+        """显式杀死 MCP 子进程，防止资源泄漏"""
+        if self._is_mock:
+            return
+
+        try:
+            parent = psutil.Process(os.getpid())
+            current_children = parent.children(recursive=False)
+
+            # 找到新创建的 MCP 子进程
+            for child in current_children:
+                if child.pid in self._child_pids_before:
+                    continue  # 跳过启动前就存在的子进程
+
+                # 检查是否是 MCP Server 进程
+                try:
+                    cmdline = " ".join(child.cmdline())
+                    if "xhs_mcp_server" in cmdline:
+                        logger.debug(f"[MCP] 终止子进程 PID={child.pid}")
+                        try:
+                            child.terminate()
+                            child.wait(timeout=2)
+                        except psutil.TimeoutExpired:
+                            child.kill()
+                        except psutil.NoSuchProcess:
+                            pass
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except Exception as e:
+            logger.warning(f"[MCP] 清理子进程失败: {e}")
 
     async def _call(self, tool: str, args: dict[str, Any]) -> Any:
         assert self._session, "Client not connected"

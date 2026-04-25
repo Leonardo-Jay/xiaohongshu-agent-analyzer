@@ -65,9 +65,16 @@ async def _execute_retrieve_tool(
             return {"status": "ok", "keyword": keyword, "found": len(posts), "new_added": added}
         except Exception as e:
             logger.warning(f"[Retrieve][FC] search_posts failed '{keyword}': {e}")
-            if "登录已过期" in str(e) or "login" in str(e).lower():
+            error_msg = str(e)
+
+            # 检测Cookie过期错误
+            if ("登录已过期" in error_msg or
+                "login" in error_msg.lower() or
+                "'a1'" in error_msg or  # 小红书Cookie过期错误码
+                "COOKIE_EXPIRED" in error_msg):
                 raise RuntimeError("COOKIE_EXPIRED")
-            return {"status": "error", "error": str(e)}
+
+            return {"status": "error", "error": error_msg}
 
     return {"status": "unknown_tool", "name": tc.name}
 

@@ -41,6 +41,7 @@ else:
     )
 
 from app.api.v1.routes_analysis import router as analysis_router
+from app.middleware import SecurityMiddleware
 
 
 @asynccontextmanager
@@ -63,6 +64,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 添加安全中间件
+security_middleware = SecurityMiddleware(
+    rate_limit_per_minute=100,
+    rate_limit_per_hour=500,
+    block_duration_seconds=600,
+)
+app.middleware("http")(security_middleware)
 
 app.include_router(analysis_router)
 

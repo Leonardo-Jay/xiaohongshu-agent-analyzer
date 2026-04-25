@@ -27,7 +27,7 @@ _llm_reasoning = create_llm(temperature=0)
 _llm_action = create_llm(temperature=0)
 _llm_observation = create_llm(temperature=0)
 
-_MAX_INTENT_ROUNDS = 2  # 最多 2 轮 ReAct 循环
+_MAX_INTENT_ROUNDS = 3  # 最多 2 轮 ReAct 循环
 
 
 def _parse_reasoning_json(text: str) -> dict[str, Any]:
