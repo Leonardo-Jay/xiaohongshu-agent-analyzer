@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from contextlib import asynccontextmanager
@@ -23,6 +24,17 @@ from typing import Any
 
 import psutil
 from loguru import logger
+
+# 应用 Monkey Patch（在导入 MCP 之前）
+from app.tools.mcp_client_patch import (
+    apply_patch,
+    clear_mcp_children,
+    cleanup_all_python_children,
+)
+
+apply_patch()
+
+# 然后导入 MCP
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
@@ -78,7 +90,8 @@ async def _ensure_preflight() -> None:
         if _preflight_done:
             return
         try:
-            await asyncio.to_thread(_preflight_check)
+            # 直接同步执行（预检很快，不需要线程池）
+            _preflight_check()
         except RuntimeError:
             raise
         except Exception as e:
@@ -93,7 +106,6 @@ class XhsMcpClient:
         self._cm = None
         self._cookie = cookie
         self._is_mock = (self._cookie == "-1" or os.environ.get("XHS_COOKIES") == "-1")
-        self._child_pids_before: set[int] = set()  # 记录启动前的子进程 PID
 
     async def __aenter__(self) -> "XhsMcpClient":
         if self._is_mock:
@@ -101,13 +113,6 @@ class XhsMcpClient:
             return self
         # 预检：只执行一次（并发安全）
         await _ensure_preflight()
-
-        # 记录启动前的子进程 PID
-        try:
-            parent = psutil.Process(os.getpid())
-            self._child_pids_before = {p.pid for p in parent.children(recursive=False)}
-        except Exception:
-            self._child_pids_before = set()
 
         env = dict(os.environ)
         if self._cookie:
@@ -130,6 +135,9 @@ class XhsMcpClient:
         logger.debug("XhsMcpClient connected")
         return self
 
+        logger.debug("XhsMcpClient connected")
+        return self
+
     async def __aexit__(self, *exc):
         # 1. 关闭 session
         if self._session:
@@ -145,39 +153,17 @@ class XhsMcpClient:
             except Exception:
                 pass
 
-        # 3. 显式杀死 MCP 子进程
-        await self._kill_mcp_subprocess()
+        # 3. 使用 Monkey Patch 的注册表清理（精确且优雅）
+        logger.info("[MCP] 开始清理子进程...")
+        cleared = clear_mcp_children()
 
-    async def _kill_mcp_subprocess(self):
-        """显式杀死 MCP 子进程，防止资源泄漏"""
-        if self._is_mock:
-            return
+        # 诊断：检查清理后的状态
+        logger.info(
+            f"[MCP] 清理后状态: threads={threading.active_count()}"
+        )
 
-        try:
-            parent = psutil.Process(os.getpid())
-            current_children = parent.children(recursive=False)
+        logger.debug(f"[MCP] XhsMcpClient 已关闭，清理了 {cleared} 个子进程")
 
-            # 找到新创建的 MCP 子进程
-            for child in current_children:
-                if child.pid in self._child_pids_before:
-                    continue  # 跳过启动前就存在的子进程
-
-                # 检查是否是 MCP Server 进程
-                try:
-                    cmdline = " ".join(child.cmdline())
-                    if "xhs_mcp_server" in cmdline:
-                        logger.debug(f"[MCP] 终止子进程 PID={child.pid}")
-                        try:
-                            child.terminate()
-                            child.wait(timeout=2)
-                        except psutil.TimeoutExpired:
-                            child.kill()
-                        except psutil.NoSuchProcess:
-                            pass
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-        except Exception as e:
-            logger.warning(f"[MCP] 清理子进程失败: {e}")
 
     async def _call(self, tool: str, args: dict[str, Any]) -> Any:
         assert self._session, "Client not connected"
@@ -259,12 +245,25 @@ class XhsMcpClientPool:
         return self
 
     async def __aexit__(self, *exc) -> None:
+        # 关闭所有客户端
         for c in self._clients:
             try:
                 await c.__aexit__(None, None, None)
             except Exception:
                 pass
-        logger.debug("[Pool] MCP 客户端连接池已关闭")
+
+        # 诊断：检查清理后的状态
+        logger.info(
+            f"[Pool] 清理后状态: "
+            f"asyncio_tasks={len(asyncio.all_tasks())}, "
+            f"threads={threading.active_count()}"
+        )
+
+        # workers=2 环境下的双重保险：清理所有 Python 子进程
+        logger.info("[Pool] 开始清理所有子进程...")
+        cleanup_all_python_children()
+
+        logger.info("[Pool] MCP 客户端连接池已关闭")
 
     @asynccontextmanager
     async def borrow(self):

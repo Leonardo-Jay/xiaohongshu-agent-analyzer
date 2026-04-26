@@ -11,14 +11,31 @@
 import asyncio
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from threading import Thread
 from typing import Any
 
 from loguru import logger
 
 from app.memory.memory_types import Evidence
+
+
+# 全局线程池（复用，避免创建多个）
+_evidence_thread_pool: ThreadPoolExecutor | None = None
+
+
+def _get_thread_pool() -> ThreadPoolExecutor:
+    """获取全局线程池（懒加载）"""
+    global _evidence_thread_pool
+    if _evidence_thread_pool is None:
+        # 创建 daemon 线程池，程序退出时自动清理
+        _evidence_thread_pool = ThreadPoolExecutor(
+            max_workers=2,  # 最多 2 个线程
+            thread_name_prefix="evidence_saver",
+        )
+        logger.info("[EvidenceSaver] 创建全局线程池: max_workers=2")
+    return _evidence_thread_pool
 
 
 class EvidenceSaver:
@@ -29,7 +46,7 @@ class EvidenceSaver:
         # 内存缓存：content_hash -> evidence_id（避免重复计算哈希）
         self._hash_cache: dict[str, str] = {}
 
-    def save_evidence_async(
+    async def save_evidence_async(
         self,
         entity: str,
         screened_items: list[dict],
@@ -37,23 +54,28 @@ class EvidenceSaver:
         retrieved_comments: list[dict] | None = None
     ) -> None:
         """
-        异步保存证据（后台线程）
+        异步保存证据（使用全局线程池）
 
         使用场景：报告生成完成后，后台异步保存证据，不阻塞用户看到报告
         """
-        def _save_in_background():
-            try:
-                # 直接调用同步方法（不需要 asyncio.run）
-                self._save_evidence_batch_sync(
-                    entity, screened_items, clusters, retrieved_comments
-                )
-            except Exception as e:
-                logger.error(f"[EvidenceSaver] 后台保存证据失败: {e}")
+        loop = asyncio.get_event_loop()
+        pool = _get_thread_pool()
 
-        # 启动后台线程
-        thread = Thread(target=_save_in_background, daemon=True)
-        thread.start()
-        logger.info(f"[EvidenceSaver] 启动后台线程保存证据: entity={entity}")
+        try:
+            # 使用全局线程池执行同步 I/O
+            await loop.run_in_executor(
+                pool,
+                self._save_evidence_batch_sync,
+                entity, screened_items, clusters, retrieved_comments
+            )
+            logger.info(f"[EvidenceSaver] 后台保存证据完成: entity={entity}")
+        except asyncio.CancelledError:
+            # 任务被取消，记录但不阻塞
+            logger.warning(f"[EvidenceSaver] 证据保存被取消: entity={entity}")
+            # 注意：线程池中的任务会继续执行，但不阻塞主流程
+            raise  # 重新抛出，让调用方知道
+        except Exception as e:
+            logger.error(f"[EvidenceSaver] 后台保存证据失败: {e}")
 
     def save_evidence_batch(
         self,

@@ -454,64 +454,6 @@ async def run_analysis(
         state = {**state, **synthesis_output}
         _progress(queue, "synthesize", "报告生成完毕", 97)
 
-        # ── 集成到实体记忆（Ingest 操作）──
-        if enable_memory and state.get("product_entities"):
-            try:
-                from app.memory import get_memory_manager, get_evidence_saver
-
-                entity = state.get("product_entities", [""])[0]
-                intent = state.get("intent", "general")
-                clusters = state.get("clusters", [])
-                screened_items = state.get("screened_items", [])
-                retrieved_comments = state.get("retrieved_comments", [])
-                reuse_strategy = state.get("_reuse_strategy", "none")
-
-                # 调用记忆集成（异步保存证据）
-                memory_manager = get_memory_manager()
-
-                # 异步保存证据（不阻塞报告生成）
-                evidence_saver = get_evidence_saver()
-                evidence_saver.save_evidence_async(
-                    entity=entity,
-                    screened_items=screened_items,
-                    clusters=clusters,
-                    retrieved_comments=retrieved_comments
-                )
-
-                # 立即更新记忆（不等证据保存完成）
-                memory_manager.ingest_analysis_result(
-                    entity=entity,
-                    clusters=clusters,
-                    screened_items=screened_items,
-                    retrieved_comments=retrieved_comments,
-                    query=query,
-                    intent=intent,
-                    request_id=run_id,
-                    reuse_strategy=reuse_strategy,
-                    skip_evidence_save=True  # NEW: 跳过同步保存，使用异步保存
-                )
-
-                logger.info(f"[Workflow][Memory] 记忆集成完成: entity={entity}")
-
-            except Exception as e:
-                logger.warning(f"[Workflow][Memory] 记忆集成失败: {e}")
-
-        # ── 更新短期会话记忆 ──
-        if enable_memory and session_id and state.get("product_entities"):
-            try:
-                session_manager = get_session_manager()
-                session_manager.update_session(
-                    session_id=session_id,
-                    query=query,
-                    entity=state.get("product_entities", [""])[0],
-                    intent=state.get("intent", "general"),
-                    note_ids=[p.get("note_id", "") for p in state.get("screened_items", [])],
-                    clusters=state.get("clusters", [])
-                )
-                logger.info(f"[Workflow][Memory] 已更新短期会话记忆: session_id={session_id}")
-            except Exception as e:
-                logger.warning(f"[Workflow][Memory] 更新会话记忆失败: {e}")
-
         # ── 推送最终结果（references 由 synthesis_agent 生成）
         queue.put_nowait({
             "event": "result",
@@ -584,4 +526,80 @@ async def run_analysis(
         if not isinstance(e, Exception):
             raise
     finally:
+        # ── 在 finally 中保存证据（即使任务被取消也会执行）──
+        if enable_memory and state.get("product_entities"):
+            try:
+                from app.memory import get_memory_manager, get_evidence_saver
+
+                entity = state.get("product_entities", [""])[0]
+                intent = state.get("intent", "general")
+                clusters = state.get("clusters", [])
+                screened_items = state.get("screened_items", [])
+                retrieved_comments = state.get("retrieved_comments", [])
+                reuse_strategy = state.get("_reuse_strategy", "none")
+
+                # 调用记忆集成（异步保存证据）
+                memory_manager = get_memory_manager()
+
+                # 异步保存证据（使用全局线程池）
+                evidence_saver = get_evidence_saver()
+                await evidence_saver.save_evidence_async(
+                    entity=entity,
+                    screened_items=screened_items,
+                    clusters=clusters,
+                    retrieved_comments=retrieved_comments
+                )
+
+                # 立即更新记忆（不等证据保存完成）
+                memory_manager.ingest_analysis_result(
+                    entity=entity,
+                    clusters=clusters,
+                    screened_items=screened_items,
+                    retrieved_comments=retrieved_comments,
+                    query=query,
+                    intent=intent,
+                    request_id=run_id,
+                    reuse_strategy=reuse_strategy,
+                    skip_evidence_save=True  # NEW: 跳过同步保存，使用异步保存
+                )
+
+                logger.info(f"[Workflow][Memory] 记忆集成完成: entity={entity}")
+
+            except asyncio.CancelledError:
+                logger.warning(f"[Workflow] 证据保存被取消")
+            except Exception as e:
+                logger.warning(f"[Workflow][Memory] 记忆集成失败: {e}")
+
+        # ── 更新短期会话记忆 ──
+        if enable_memory and session_id and state.get("product_entities"):
+            try:
+                session_manager = get_session_manager()
+                session_manager.update_session(
+                    session_id=session_id,
+                    query=query,
+                    entity=state.get("product_entities", [""])[0],
+                    intent=state.get("intent", "general"),
+                    note_ids=[p.get("note_id", "") for p in state.get("screened_items", [])],
+                    clusters=state.get("clusters", [])
+                )
+                logger.info(f"[Workflow][Memory] 已更新短期会话记忆: session_id={session_id}")
+            except Exception as e:
+                logger.warning(f"[Workflow][Memory] 更新会话记忆失败: {e}")
+
+        # ── 清理未完成的 asyncio 任务 ──
+        try:
+            tasks = asyncio.all_tasks()
+            current_task = asyncio.current_task()
+
+            cancelled_count = 0
+            for task in tasks:
+                if task is not current_task and not task.done():
+                    task.cancel()
+                    cancelled_count += 1
+
+            if cancelled_count > 0:
+                logger.info(f"[Workflow] 取消了 {cancelled_count} 个未完成的 asyncio 任务")
+        except Exception as e:
+            logger.warning(f"[Workflow] 清理任务失败: {e}")
+
         queue.put_nowait(None)  # 哨兵：通知 SSE 生成器流结束

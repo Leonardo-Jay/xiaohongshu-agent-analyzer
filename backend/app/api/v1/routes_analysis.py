@@ -99,6 +99,7 @@ async def _run_and_cleanup(
     cookie: str | None = None,
     enable_memory: bool | None = None
 ) -> None:
+    cancelled = False
     try:
         await run_analysis(query, run_id, q, cookie=cookie, enable_memory=enable_memory)
         if run_id in _tasks:
@@ -113,6 +114,20 @@ async def _run_and_cleanup(
             )
     except BaseException as e:
         if isinstance(e, asyncio.CancelledError):
+            cancelled = True
+            logger.info(f"[Routes] 任务被取消 run_id={run_id}")
+            q.put_nowait({"event": "error", "data": {"code": "CANCELLED", "message": "任务已取消"}})
+            q.put_nowait(None)
+            if run_id in _tasks:
+                _tasks[run_id]["status"] = "cancelled"
+                append_audit_log(
+                    "analysis_cancelled",
+                    run_id=run_id,
+                    ip=_tasks[run_id].get("ip", "unknown"),
+                    query=query,
+                    status="cancelled",
+                    duration_seconds=round(time.time() - _tasks[run_id].get("started_at", time.time()), 2),
+                )
             raise
         exc_repr = f"[{type(e).__name__}] {e!r}"
         logger.error(f"[Routes] 未捕获异常 run_id={run_id}: {exc_repr}")
@@ -132,8 +147,13 @@ async def _run_and_cleanup(
         if not isinstance(e, Exception):
             raise
     finally:
-        await asyncio.sleep(_QUEUE_TTL)
-        _tasks.pop(run_id, None)
+        # 如果是取消，立即清理；否则等待 TTL
+        if cancelled:
+            _tasks.pop(run_id, None)
+            logger.info(f"[Routes] 任务已取消并清理 run_id={run_id}")
+        else:
+            await asyncio.sleep(_QUEUE_TTL)
+            _tasks.pop(run_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +225,21 @@ async def stream_result(run_id: str, request: Request):
         yield {"event": "ping", "data": json.dumps({"run_id": run_id}, ensure_ascii=False)}
         try:
             while True:
+                # 检查客户端是否断开连接
+                if await request.is_disconnected():
+                    logger.warning(f"[SSE] 客户端断开连接 run_id={run_id}")
+                    # 取消后台任务
+                    if run_id in _tasks:
+                        task = _tasks[run_id].get("task")
+                        if task and not task.done():
+                            logger.info(f"[SSE] 取消后台任务 run_id={run_id}")
+                            task.cancel()
+                            try:
+                                await task
+                            except asyncio.CancelledError:
+                                pass
+                    break
+
                 item = await asyncio.wait_for(q.get(), timeout=600)
                 if item is None:
                     # 哨兵：流正常结束
@@ -259,3 +294,98 @@ async def check_cookie(cookie: str | None = Query(None)):
               (part.split("=", 1) if "=" in part else (part, "") for part in xhs_cookie.split(sep))}
     valid = bool(fields.get("web_session") and fields.get("a1"))
     return JSONResponse({"valid": valid, "source": source})
+
+
+# ---------------------------------------------------------------------------
+# GET /debug/tasks  — 查看所有 asyncio 任务
+# ---------------------------------------------------------------------------
+
+@router.get("/debug/tasks", summary="查看所有 asyncio 任务")
+async def debug_all_tasks():
+    """
+    诊断端点：检查是否有泄漏的 asyncio 任务
+    """
+    import asyncio
+    tasks = asyncio.all_tasks()
+    task_info = []
+    for task in tasks:
+        task_info.append({
+            "name": task.get_name(),
+            "done": task.done(),
+            "cancelled": task.cancelled(),
+            "coro": str(task.get_coro())[:200],
+        })
+    return {"count": len(tasks), "tasks": task_info}
+
+
+# ---------------------------------------------------------------------------
+# GET /debug/threads  — 查看所有线程
+# ---------------------------------------------------------------------------
+
+@router.get("/debug/threads", summary="查看所有线程")
+async def debug_threads():
+    """
+    诊断端点：检查线程状态
+    """
+    import threading
+    threads = []
+    for thread in threading.enumerate():
+        threads.append({
+            "name": thread.name,
+            "daemon": thread.daemon,
+            "alive": thread.is_alive(),
+            "ident": thread.ident,
+        })
+    return {"count": len(threads), "threads": threads}
+
+
+@router.get("/debug/tasks", summary="查看所有 asyncio 任务")
+async def debug_all_tasks():
+    """
+    诊断端点：检查是否有泄漏的 asyncio 任务
+    """
+    import asyncio
+    tasks = asyncio.all_tasks()
+    task_info = []
+    for task in tasks:
+        task_info.append({
+            "name": task.get_name(),
+            "done": task.done(),
+            "cancelled": task.cancelled(),
+            "coro": str(task.get_coro())[:300],
+        })
+    return {"count": len(tasks), "tasks": task_info}
+
+
+@router.get("/debug/fds", summary="查看文件描述符")
+async def debug_fds():
+    """
+    诊断端点：检查是否有文件描述符泄漏
+    """
+    import os
+    import psutil
+
+    proc = psutil.Process(os.getpid())
+
+    open_files = []
+    for fd in proc.open_files():
+        open_files.append({
+            "fd": fd.fd,
+            "path": fd.path,
+        })
+
+    connections = []
+    for conn in proc.connections():
+        connections.append({
+            "fd": conn.fd,
+            "status": conn.status,
+            "laddr": str(conn.laddr) if conn.laddr else None,
+            "raddr": str(conn.raddr) if conn.raddr else None,
+        })
+
+    return {
+        "open_files_count": len(open_files),
+        "connections_count": len(connections),
+        "open_files": open_files[:20],
+        "connections": connections[:20],
+    }
