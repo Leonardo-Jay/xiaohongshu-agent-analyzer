@@ -2,13 +2,26 @@
     XHS_COOKIES = -1时可不进行爬虫，仅测试功能改动或llm生成效果"""
 
 from __future__ import annotations
+from datetime import datetime, timedelta, timezone
 import random
 import uuid
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 def _generate_fake_id() -> str:
     return uuid.uuid4().hex[:24]
 
-def generate_mock_posts(query: str, require_num: int = 25) -> list[dict]:
+def _shanghai_tz():
+    try:
+        return ZoneInfo("Asia/Shanghai")
+    except ZoneInfoNotFoundError:
+        return timezone(timedelta(hours=8), name="Asia/Shanghai")
+
+def _mock_time(days_ago: int, hour_offset: int = 0) -> tuple[str, str]:
+    dt = datetime.now(_shanghai_tz()) - timedelta(days=days_ago, hours=hour_offset)
+    return dt.strftime("%Y-%m-%d %H:%M:%S"), dt.isoformat(timespec="seconds")
+
+
+def generate_mock_posts(query: str, require_num: int = 25, sort_type: int = 0) -> list[dict]:
     """生成用来“喂饱”RetrieveAgent的伪造帖子列表"""
     posts = []
     # 模拟真实搜索返回的不同类型标题格式
@@ -37,14 +50,18 @@ def generate_mock_posts(query: str, require_num: int = 25) -> list[dict]:
         note_id = _generate_fake_id()
         title = random.choice(title_templates).format(query=query)
         desc = random.choice(desc_templates).format(query=query)
+        upload_time, published_at = _mock_time(days_ago=(i * 3) % 120, hour_offset=i % 12)
 
         posts.append({
             "note_id": note_id,
             "note_url": f"https://www.xiaohongshu.com/explore/{note_id}",
             "title": title,
             "desc": desc,
+            "upload_time": upload_time,
+            "published_at": published_at,
             "like_count": random.randint(10, 10000),
             "comment_count": random.randint(5, 500),
+            "sort_type_used": sort_type,
             "display_title": title[:10] + "...",
             "collected_count": random.randint(1, 1000),
             "tags": [{"name": query}, {"name": "真实测评"}],
@@ -55,18 +72,27 @@ def generate_mock_posts(query: str, require_num: int = 25) -> list[dict]:
                 "avatar": "fake"
             }
         })
+    if sort_type == 1:
+        posts.sort(key=lambda post: post.get("published_at", ""), reverse=True)
+    elif sort_type == 2:
+        posts.sort(key=lambda post: int(post.get("like_count", 0)), reverse=True)
+    elif sort_type == 3:
+        posts.sort(key=lambda post: int(post.get("comment_count", 0)), reverse=True)
     return posts
 
 def generate_mock_detail(note_url: str) -> dict:
     """生成单篇帖子大段图文内容的详细数据（为了过Screen质量检测）"""
     note_id = note_url.split("/")[-1] if "/" in note_url else note_url
     query = "产品"
+    upload_time, published_at = _mock_time(days_ago=random.randint(0, 90))
 
     return {
         "note_id": note_id,
         "note_url": note_url,
         "title": f"关于{query}的深度干货分享！",
         "desc": f"这次真的要好好夸一夸（或者骂一骂）这件事。关于 {query}，很多人可能还停留在以前的印象中。\n而最近我深度使用了将近一个月的时间。无论是产品本身的续航、性能释放还是外观做工，其实都有一些值得被大家看到（或者吐槽）的地方。\n\n优点：\n1. 外观设计不错，属于第一眼就能抓住人的类型。\n2. 质感在线，拿在手里不会觉得廉价。\n\n缺点：\n1. 重量有点重，长时间单手握持会很累。\n2. 价格稍微有些虚高了，如果在双十一或者有大促的时候入手可能更划算点。\n\n总结：如果你是一个重度颜控用户，可以考虑；但如果是追求极致性价比的学生党，建议再等等市场降价或者选择其他竞品。\n(此文纯人工手打，不含任何合作广告)",
+        "upload_time": upload_time,
+        "published_at": published_at,
         "like_count": random.randint(100, 5000),
         "comment_count": random.randint(50, 300),
         "display_title": "深度测评细节",
@@ -107,10 +133,13 @@ def generate_mock_comments(note_url: str, num_comments: int = 35) -> list[dict]:
 
     for i in range(max(num_comments, 35)):
         content = random.choice(comment_templates)
+        create_time, created_at = _mock_time(days_ago=(i * 2) % 90, hour_offset=i % 24)
         comments.append({
             "comment_id": _generate_fake_id(),
             "content": content,
             "like_count": random.randint(0, 500),
-            "nickname": f"网友_{random.randint(10000, 99999)}"
+            "nickname": f"网友_{random.randint(10000, 99999)}",
+            "create_time": create_time,
+            "created_at": created_at,
         })
     return comments

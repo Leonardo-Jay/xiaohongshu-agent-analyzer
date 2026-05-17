@@ -25,10 +25,14 @@ from app.utils.daily_audit_log import append_audit_log
 
 router = APIRouter(prefix="/api/v1/analysis", tags=["analysis"])
 
-# run_id -> {"queue": asyncio.Queue, "status": str, "query": str, "task": asyncio.Task, "ip": str, "started_at": float}
+# run_id -> {"queue": asyncio.Queue, "status": str, "query": str, "task": asyncio.Task, "ip": str, "started_at": float, "session_id": str}
 _tasks: dict[str, dict] = {}
 
 _QUEUE_TTL = 300  # 任务结果保留秒数
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_DEBUG_ROUTES_ENABLED = os.getenv("ENABLE_DEBUG_ROUTES", "false").strip().lower() in _TRUE_VALUES
+_DEBUG_API_TOKEN = os.getenv("DEBUG_API_TOKEN", "").strip()
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 
 class AnalysisRequestV2(BaseModel):
@@ -57,10 +61,13 @@ async def start_analysis(req: AnalysisRequestV2, request: Request):
     - 返回 `run_id`，用于后续 SSE 流接入。
     - 若传入相同 `session_id` 且任务仍在运行，返回 409。
     """
-    run_id = req.session_id or str(uuid.uuid4())
+    run_id = str(uuid.uuid4())
     client_ip = request.client.host if request.client else "unknown"
 
-    if run_id in _tasks and _tasks[run_id]["status"] == "running":
+    if req.session_id and any(
+        task.get("session_id") == req.session_id and task.get("status") == "running"
+        for task in _tasks.values()
+    ):
         raise HTTPException(status_code=409, detail="该 session_id 的任务正在执行中")
 
     q: asyncio.Queue = asyncio.Queue()
@@ -71,13 +78,15 @@ async def start_analysis(req: AnalysisRequestV2, request: Request):
         "task": None,
         "ip": client_ip,
         "started_at": time.time(),
+        "session_id": req.session_id,
     }
     task = asyncio.create_task(_run_and_cleanup(
         run_id,
         req.query,
         q,
         cookie=req.cookie,
-        enable_memory=req.enable_memory
+        enable_memory=req.enable_memory,
+        session_id=req.session_id,
     ))
     _tasks[run_id]["task"] = task
     logger.info(f"[Routes] 任务启动 run_id={run_id} query={req.query}")
@@ -97,11 +106,12 @@ async def _run_and_cleanup(
     query: str,
     q: asyncio.Queue,
     cookie: str | None = None,
-    enable_memory: bool | None = None
+    enable_memory: bool | None = None,
+    session_id: str | None = None,
 ) -> None:
     cancelled = False
     try:
-        await run_analysis(query, run_id, q, cookie=cookie, enable_memory=enable_memory)
+        await run_analysis(query, run_id, q, cookie=cookie, enable_memory=enable_memory, session_id=session_id)
         if run_id in _tasks:
             _tasks[run_id]["status"] = "done"
             append_audit_log(
@@ -204,7 +214,7 @@ async def stream_result(run_id: str, request: Request):
 
     事件类型:
     - `progress`: `{stage, message, progress}`
-    - `result`:   `{final_answer, confidence_score, clusters, sentiment_summary, ...}`
+    - `result`:   `{final_answer, report_ir, confidence_score, clusters, sentiment_summary, ...}`
     - `error`:    `{code, message}`
     """
     if run_id not in _tasks:
@@ -296,96 +306,96 @@ async def check_cookie(cookie: str | None = Query(None)):
     return JSONResponse({"valid": valid, "source": source})
 
 
-# ---------------------------------------------------------------------------
-# GET /debug/tasks  — 查看所有 asyncio 任务
-# ---------------------------------------------------------------------------
-
-@router.get("/debug/tasks", summary="查看所有 asyncio 任务")
-async def debug_all_tasks():
-    """
-    诊断端点：检查是否有泄漏的 asyncio 任务
-    """
-    import asyncio
-    tasks = asyncio.all_tasks()
-    task_info = []
-    for task in tasks:
-        task_info.append({
-            "name": task.get_name(),
-            "done": task.done(),
-            "cancelled": task.cancelled(),
-            "coro": str(task.get_coro())[:200],
-        })
-    return {"count": len(tasks), "tasks": task_info}
+def _ensure_debug_access(request: Request) -> None:
+    """Guard debug endpoints when they are explicitly enabled for diagnostics."""
+    client_host = request.client.host if request.client else ""
+    token = request.headers.get("x-debug-token", "")
+    forwarded_for = request.headers.get("x-forwarded-for", "").strip()
+    if _DEBUG_API_TOKEN and token == _DEBUG_API_TOKEN:
+        return
+    if client_host in _LOOPBACK_HOSTS and not forwarded_for:
+        return
+    raise HTTPException(status_code=403, detail="debug endpoints are restricted")
 
 
-# ---------------------------------------------------------------------------
-# GET /debug/threads  — 查看所有线程
-# ---------------------------------------------------------------------------
+if _DEBUG_ROUTES_ENABLED:
+    # ---------------------------------------------------------------------------
+    # GET /debug/tasks  — 查看所有 asyncio 任务
+    # ---------------------------------------------------------------------------
 
-@router.get("/debug/threads", summary="查看所有线程")
-async def debug_threads():
-    """
-    诊断端点：检查线程状态
-    """
-    import threading
-    threads = []
-    for thread in threading.enumerate():
-        threads.append({
-            "name": thread.name,
-            "daemon": thread.daemon,
-            "alive": thread.is_alive(),
-            "ident": thread.ident,
-        })
-    return {"count": len(threads), "threads": threads}
-
-
-@router.get("/debug/tasks", summary="查看所有 asyncio 任务")
-async def debug_all_tasks():
-    """
-    诊断端点：检查是否有泄漏的 asyncio 任务
-    """
-    import asyncio
-    tasks = asyncio.all_tasks()
-    task_info = []
-    for task in tasks:
-        task_info.append({
-            "name": task.get_name(),
-            "done": task.done(),
-            "cancelled": task.cancelled(),
-            "coro": str(task.get_coro())[:300],
-        })
-    return {"count": len(tasks), "tasks": task_info}
+    @router.get("/debug/tasks", summary="查看所有 asyncio 任务")
+    async def debug_all_tasks(request: Request):
+        """
+        诊断端点：检查是否有泄漏的 asyncio 任务。
+        默认不注册；仅 ENABLE_DEBUG_ROUTES=true 时可用。
+        """
+        _ensure_debug_access(request)
+        tasks = asyncio.all_tasks()
+        task_info = []
+        for task in tasks:
+            task_info.append({
+                "name": task.get_name(),
+                "done": task.done(),
+                "cancelled": task.cancelled(),
+                "coro": str(task.get_coro())[:300],
+            })
+        return {"count": len(tasks), "tasks": task_info}
 
 
-@router.get("/debug/fds", summary="查看文件描述符")
-async def debug_fds():
-    """
-    诊断端点：检查是否有文件描述符泄漏
-    """
-    import os
-    import psutil
+    # ---------------------------------------------------------------------------
+    # GET /debug/threads  — 查看所有线程
+    # ---------------------------------------------------------------------------
 
-    proc = psutil.Process(os.getpid())
+    @router.get("/debug/threads", summary="查看所有线程")
+    async def debug_threads(request: Request):
+        """
+        诊断端点：检查线程状态。
+        默认不注册；仅 ENABLE_DEBUG_ROUTES=true 时可用。
+        """
+        import threading
 
-    open_files = []
-    for fd in proc.open_files():
-        open_files.append({
-            "fd": fd.fd,
-            "path": fd.path,
-        })
+        _ensure_debug_access(request)
+        threads = []
+        for thread in threading.enumerate():
+            threads.append({
+                "name": thread.name,
+                "daemon": thread.daemon,
+                "alive": thread.is_alive(),
+                "ident": thread.ident,
+            })
+        return {"count": len(threads), "threads": threads}
 
-    connections = []
-    for conn in proc.connections():
-        connections.append({
-            "fd": conn.fd,
-            "status": conn.status,
-            "laddr": str(conn.laddr) if conn.laddr else None,
-            "raddr": str(conn.raddr) if conn.raddr else None,
-        })
 
-    return {
-        "open_files_count": len(open_files),
-        "connections_count": len(connections),
-        "open_files": open_files[:20],
-        "connections": connections[:20],
-    }
+    @router.get("/debug/fds", summary="查看文件描述符")
+    async def debug_fds(request: Request):
+        """
+        诊断端点：检查是否有文件描述符泄漏。
+        默认不注册；仅 ENABLE_DEBUG_ROUTES=true 时可用。
+        """
+        import psutil
+
+        _ensure_debug_access(request)
+        proc = psutil.Process(os.getpid())
+
+        open_files = []
+        for fd in proc.open_files():
+            open_files.append({
+                "fd": fd.fd,
+                "path": fd.path,
+            })
+
+        connections = []
+        for conn in proc.net_connections():
+            connections.append({
+                "fd": conn.fd,
+                "status": conn.status,
+                "laddr": str(conn.laddr) if conn.laddr else None,
+                "raddr": str(conn.raddr) if conn.raddr else None,
+            })
+
+        return {
+            "open_files_count": len(open_files),
+            "connections_count": len(connections),
+            "open_files": open_files[:20],
+            "connections": connections[:20],
+        }

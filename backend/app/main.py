@@ -41,13 +41,24 @@ else:
     )
 
 from app.api.v1.routes_analysis import router as analysis_router
+from app.api.v1.routes_export import router as export_router
+from app.api.v1.routes_hotspots import router as hotspots_router
 from app.middleware import SecurityMiddleware
+from app.services.home_hotspots import home_hotspots_service
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("AI 产品舆情分析系统启动")
-    yield
+    hotspots_task = asyncio.create_task(home_hotspots_service.start_scheduler())
+    try:
+        yield
+    finally:
+        hotspots_task.cancel()
+        try:
+            await hotspots_task
+        except asyncio.CancelledError:
+            pass
     logger.info("AI 产品舆情分析系统关闭")
 
 
@@ -74,6 +85,8 @@ security_middleware = SecurityMiddleware(
 app.middleware("http")(security_middleware)
 
 app.include_router(analysis_router)
+app.include_router(export_router)
+app.include_router(hotspots_router)
 
 
 @app.get("/health")

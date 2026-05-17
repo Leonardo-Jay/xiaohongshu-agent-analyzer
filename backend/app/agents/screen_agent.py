@@ -88,6 +88,11 @@ def _compress_post(post: dict[str, Any]) -> dict[str, Any]:
         "desc_preview": desc_preview,
         "tags": (post.get("tags") or [])[:5],
         "note_type": post.get("note_type", ""),
+        "upload_time": post.get("upload_time", ""),
+        "published_at": post.get("published_at", ""),
+        "published_at_raw": post.get("published_at_raw", ""),
+        "sort_type_used": post.get("sort_type_used"),
+        "matched_time_window": post.get("matched_time_window", True),
         "engagement": {
             "like": post.get("like_count", 0),
             "comment": post.get("comment_count", 0),
@@ -264,6 +269,7 @@ async def node_rank_and_select(state: GraphState) -> dict[str, Any]:
     intent = state.get("intent", "general")
     key_aspects = state.get("key_aspects", [])
     user_needs = state.get("user_needs", [])
+    temporal_context = state.get("temporal_context", {}) or {}
 
     genuine_posts = state.get("_ad_detect_passed", [])
     all_posts_after_filter = state.get("_pre_filter_passed", [])
@@ -365,7 +371,12 @@ async def node_rank_and_select(state: GraphState) -> dict[str, Any]:
     # 如果不足目标最小值，全部选中
     selected_count = max(selected_count, min(len(scored_posts), target_min))
 
-    selected = [post for score, post in scored_posts[:selected_count]]
+    need_time_diversity = temporal_context.get("content_time_analysis") in {"auto", "required"}
+    if need_time_diversity:
+        candidate_slice = scored_posts[:max(selected_count * 2, selected_count)]
+        selected = _select_with_time_diversity(candidate_slice, selected_count)
+    else:
+        selected = [post for score, post in scored_posts[:selected_count]]
     rejected_by_relevance = len(candidate_posts) - len(selected)
 
     # 清理临时字段（不输出到最终结果）
@@ -394,9 +405,35 @@ async def node_rank_and_select(state: GraphState) -> dict[str, Any]:
             "rejected_brand": rejected_brand,
             "rejected_contact": rejected_contact,
             "rejected_low_relevance": rejected_by_relevance,
+            "time_diversity_enabled": need_time_diversity,
         },
         "_screen_done": True,
     }
+
+
+def _select_with_time_diversity(scored_posts: list[tuple[float, dict[str, Any]]], selected_count: int) -> list[dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    seen_sort_types = set()
+    seen_dates = set()
+
+    for _, post in scored_posts:
+        sort_type = post.get("sort_type_used")
+        published_at = post.get("published_at") or post.get("published_at_raw") or "unknown"
+        if sort_type not in seen_sort_types or published_at not in seen_dates:
+            selected.append(post)
+            seen_sort_types.add(sort_type)
+            seen_dates.add(published_at)
+        if len(selected) >= selected_count:
+            return selected
+
+    selected_ids = {post.get("note_id") for post in selected}
+    for _, post in scored_posts:
+        if post.get("note_id") in selected_ids:
+            continue
+        selected.append(post)
+        if len(selected) >= selected_count:
+            break
+    return selected
 
 
 def _route_screen(state: GraphState) -> Literal["__end__"]:

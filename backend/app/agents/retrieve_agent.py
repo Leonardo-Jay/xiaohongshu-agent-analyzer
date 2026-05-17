@@ -25,12 +25,20 @@ from app.prompts.templates import RETRIEVE_FC_SYSTEM_PROMPT
 from app.tools.llm import ToolCall, create_llm
 from app.tools.mcp_client import XhsMcpClient, XhsMcpClientPool
 from app.tools.tool_schemas import RETRIEVE_TOOLS
+from app.utils.temporal import parse_xhs_time, within_window
 
 _llm = create_llm(temperature=0)
 
 _MAX_RETRIEVE_ROUNDS = 3
 _MIN_POSTS = 7
 _MAX_FC_ITERATIONS = 10  # 单轮最多工具调用次数
+
+_RETRIEVAL_SORT_PLANS = {
+    "balanced": [0, 3, 1],
+    "latest_first": [1, 3],
+    "comment_hot": [3, 0],
+    "like_hot": [2, 0],
+}
 
 
 async def _execute_retrieve_tool(
@@ -40,29 +48,34 @@ async def _execute_retrieve_tool(
     exclude_set: set[str],
     new_posts: list[dict],
     new_keywords: list[str],
+    default_sort_type: int = 0,
 ) -> dict[str, Any]:
     """执行单个工具调用，返回结果供 LLM 继续推理。"""
     if tc.name == "search_posts":
         keyword = tc.arguments.get("keyword", "")
         require_num = int(tc.arguments.get("require_num", 5))
+        sort_type = int(tc.arguments.get("sort_type", default_sort_type))
+        if sort_type not in {0, 1, 2, 3, 4}:
+            sort_type = default_sort_type
 
         if keyword and keyword not in new_keywords:
             new_keywords.append(keyword)
 
         try:
             async with pool.borrow() as client:
-                posts = await client.search_posts(keyword, require_num=require_num)
+                posts = await client.search_posts(keyword, require_num=require_num, sort_type=sort_type)
 
             added = 0
             for p in posts:
                 note_id = p.get("note_id")
                 if note_id and note_id not in existing_ids and note_id not in exclude_set:
+                    p["sort_type_used"] = sort_type
                     existing_ids.add(note_id)
                     new_posts.append(p)
                     added += 1
 
-            logger.info(f"[Retrieve][FC] search_posts '{keyword}': found={len(posts)}, new_added={added}")
-            return {"status": "ok", "keyword": keyword, "found": len(posts), "new_added": added}
+            logger.info(f"[Retrieve][FC] search_posts '{keyword}': sort={sort_type}, found={len(posts)}, new_added={added}")
+            return {"status": "ok", "keyword": keyword, "sort_type": sort_type, "found": len(posts), "new_added": added}
         except Exception as e:
             logger.warning(f"[Retrieve][FC] search_posts failed '{keyword}': {e}")
             error_msg = str(e)
@@ -125,6 +138,51 @@ async def _fetch_details_concurrent(
     return enriched
 
 
+def _sort_plan_for_context(temporal_context: dict[str, Any]) -> list[int]:
+    policy = str((temporal_context or {}).get("retrieval_policy") or "balanced")
+    return _RETRIEVAL_SORT_PLANS.get(policy, _RETRIEVAL_SORT_PLANS["balanced"])
+
+
+def _annotate_and_filter_by_time(
+    posts: list[dict],
+    temporal_context: dict[str, Any],
+    current_time: dict[str, Any],
+    target_posts: int,
+) -> tuple[list[dict], dict[str, Any]]:
+    window = (temporal_context or {}).get("window") or {}
+    has_window = window.get("kind") in {"relative", "absolute"}
+    stats = {
+        "temporal_context": temporal_context or {},
+        "time_filter_applied": bool(has_window),
+        "time_filter_relaxed": False,
+        "time_filtered_count": 0,
+        "time_parseable_count": 0,
+        "sort_types_used": sorted({p.get("sort_type_used") for p in posts if p.get("sort_type_used") is not None}),
+    }
+
+    filtered = []
+    for post in posts:
+        parsed_date, raw_time, parsed = parse_xhs_time(post.get("upload_time", ""), current_time=current_time)
+        post["published_at"] = parsed_date
+        post["published_at_raw"] = raw_time
+        post["matched_time_window"] = within_window(parsed_date, temporal_context) if has_window else True
+        if parsed:
+            stats["time_parseable_count"] += 1
+        if post["matched_time_window"]:
+            filtered.append(post)
+
+    if not has_window:
+        return posts, stats
+
+    stats["time_filtered_count"] = len(filtered)
+    minimum_viable = min(target_posts, max(3, target_posts // 2))
+    if len(filtered) >= minimum_viable:
+        return filtered, stats
+
+    stats["time_filter_relaxed"] = True
+    return posts, stats
+
+
 async def node_retrieve_fc(state: GraphState, config: dict[str, Any]) -> dict[str, Any]:
     """Function Calling 版检索节点：LLM 自主决策搜索关键词和工具调用。
 
@@ -138,6 +196,8 @@ async def node_retrieve_fc(state: GraphState, config: dict[str, Any]) -> dict[st
     entities = state.get("product_entities", [])
     aliases = state.get("aliases", [])
     search_context = state.get("search_context", {})
+    temporal_context = state.get("temporal_context", {}) or {}
+    current_time = state.get("current_time", {}) or {}
     retrieved_posts = state.get("retrieved_posts", [])
     used_keywords = state.get("_used_keywords", [])
     round_num = state.get("_retrieve_round", 0) + 1
@@ -176,6 +236,7 @@ async def node_retrieve_fc(state: GraphState, config: dict[str, Any]) -> dict[st
         entities=",".join(entities) if entities else query,
         aliases=",".join(aliases) if aliases else "无",
         search_context=json.dumps(search_context, ensure_ascii=False),
+        temporal_context=json.dumps(temporal_context, ensure_ascii=False),
         used_keywords="、".join(used_keywords) if used_keywords else "无",
         current_count=len(retrieved_posts),
         target_count=target_posts,
@@ -186,6 +247,7 @@ async def node_retrieve_fc(state: GraphState, config: dict[str, Any]) -> dict[st
     new_keywords: list[str] = []
     existing_ids = {p["note_id"] for p in retrieved_posts if p.get("note_id")}
     exclude_set = set(exclude_note_ids)
+    sort_plan = _sort_plan_for_context(temporal_context)
 
     # Function Calling 多轮循环
     for iteration in range(_MAX_FC_ITERATIONS):
@@ -217,8 +279,9 @@ async def node_retrieve_fc(state: GraphState, config: dict[str, Any]) -> dict[st
         # 执行工具调用
         tool_results = []
         for tc in resp.tool_calls:
+            default_sort_type = sort_plan[iteration % len(sort_plan)] if sort_plan else 0
             result = await _execute_retrieve_tool(
-                tc, pool, existing_ids, exclude_set, new_posts, new_keywords
+                tc, pool, existing_ids, exclude_set, new_posts, new_keywords, default_sort_type
             )
             tool_results.append({
                 "role": "tool",
@@ -245,6 +308,13 @@ async def node_retrieve_fc(state: GraphState, config: dict[str, Any]) -> dict[st
         if api_type == 1:
             logger.info(f"[Retrieve][FC] api_type=1: 跳过详情拉取，保留 {len(new_posts)} 篇基本信息")
         enriched = new_posts
+
+    enriched, retrieval_stats = _annotate_and_filter_by_time(
+        enriched,
+        temporal_context,
+        current_time,
+        target_posts,
+    )
 
     total_after = len(retrieved_posts) + len(enriched)
     coverage_score = min(total_after / target_posts, 1.0) if target_posts > 0 else 1.0
@@ -277,6 +347,7 @@ async def node_retrieve_fc(state: GraphState, config: dict[str, Any]) -> dict[st
         "_target_posts": target_posts,
         "_exclude_note_ids": list(exclude_set),
         "retrieval_coverage_score": coverage_score,
+        "retrieval_stats": retrieval_stats,
         "search_attempts": state.get("search_attempts", 0) + 1,
         "_critical_errors": critical_errors,
         "_abort_analysis": abort_analysis,

@@ -32,6 +32,8 @@ class GraphState(TypedDict, total=False):
     key_aspects: list[dict[str, Any]]
     user_needs: list[str]
     search_context: dict[str, Any]
+    temporal_context: dict[str, Any]
+    current_time: dict[str, Any]
     intent_analysis_score: float
     missing_dimensions: list[str]
 
@@ -40,6 +42,7 @@ class GraphState(TypedDict, total=False):
     search_attempts: int
     retrieved_posts: Annotated[list[dict[str, Any]], operator.add]
     retrieval_coverage_score: float
+    retrieval_stats: dict[str, Any]
 
     # ── Screen 阶段（覆盖型）
     screened_items: list[dict[str, Any]]
@@ -50,6 +53,8 @@ class GraphState(TypedDict, total=False):
     clusters: list[dict[str, Any]]
     sentiment_summary: dict[str, Any]
     evidence_ledger: list[dict[str, Any]]
+    evidence_registry: list[dict[str, Any]]
+    content_time_analysis: dict[str, Any]
 
     # ── Memory
     memory_context: str
@@ -57,6 +62,7 @@ class GraphState(TypedDict, total=False):
     # ── Synthesis 阶段（覆盖型）
     confidence_score: float
     limitations: list[str]
+    report_ir: dict[str, Any]
     final_answer: str
     references: list[dict[str, Any]]
 
@@ -67,6 +73,7 @@ class GraphState(TypedDict, total=False):
     # ── 内部控制：orchestrator
     _intent_round: int
     _intent_done: bool
+    _hot_topics_metrics: dict[str, Any]
 
     # ── 内部控制：retrieve
     _retrieve_round: int
@@ -106,6 +113,9 @@ class GraphState(TypedDict, total=False):
     _reuse_ratio: float
     _enable_memory: bool
     _api_type: int
+    _session_intent_frame: dict[str, Any]
+    _session_last_run_ref: dict[str, Any]
+    _last_run_ref: dict[str, Any]
 
     # ── 错误跟踪（累加型）
     _critical_errors: Annotated[list[dict[str, Any]], operator.add]
@@ -131,4 +141,5 @@ class AnalysisResult(BaseModel):
     controversies: list[str]
     confidence_score: float
     limitations: str
+    report_ir: dict[str, Any] = Field(default_factory=dict)
     final_answer: str  # Markdown

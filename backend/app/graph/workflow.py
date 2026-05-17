@@ -50,7 +50,6 @@ from app.agents.screen_agent import build_screen_graph
 from app.models.schemas import GraphState
 from app.tools.mcp_client import XhsMcpClient, XhsMcpClientPool
 from app.utils.daily_audit_log import append_audit_log
-from app.utils.memory_storage import MemoryBlock, MemoryStorage
 from app.utils.memory_retrieval import get_memory_retrieval, ReuseDecision
 from app.utils.session_memory import get_session_manager
 
@@ -70,17 +69,36 @@ def _progress(queue: asyncio.Queue, stage: str, message: str, progress: int) -> 
     queue.put_nowait({"event": "progress", "data": {"stage": stage, "message": message, "progress": progress}})
 
 
+def _build_intent_frame(state: GraphState, raw_query: str) -> dict[str, Any]:
+    """提取 Orchestrator 的最终意图帧，供短期记忆和 run 快照引用。"""
+    return {
+        "raw_query": raw_query,
+        "rewritten_query": state.get("user_query_rewritten", raw_query),
+        "intent": state.get("intent", "general"),
+        "intent_confidence": state.get("intent_confidence", 0.0),
+        "product_entities": state.get("product_entities", []),
+        "aliases": state.get("aliases", []),
+        "key_aspects": state.get("key_aspects", []),
+        "user_needs": state.get("user_needs", []),
+        "search_context": state.get("search_context", {}),
+        "temporal_context": state.get("temporal_context", {}),
+        "current_time": state.get("current_time", {}),
+    }
+
+
 async def run_analysis(
     query: str,
     run_id: str,
     queue: asyncio.Queue,
     cookie: str | None = None,
-    enable_memory: bool | None = None
+    enable_memory: bool | None = None,
+    session_id: str | None = None,
 ) -> None:
     """在后台 task 中执行全流程，结果/错误通过 queue 发送。"""
+    enable_memory_flag = enable_memory if enable_memory is not None else (os.getenv("ENABLE_MEMORY", "false").lower() == "true")
     state: GraphState = {
         "request_id": run_id,
-        "session_id": "",
+        "session_id": session_id or "",
         "user_query_raw": query,
         # Orchestrator 初始化
         "user_query_rewritten": query,
@@ -92,6 +110,8 @@ async def run_analysis(
         "key_aspects": [],
         "user_needs": [],
         "search_context": {},
+        "temporal_context": {},
+        "current_time": {},
         "intent_analysis_score": 0.0,
         "missing_dimensions": [],
         # Retrieve 初始化
@@ -99,6 +119,7 @@ async def run_analysis(
         "search_attempts": 0,
         "retrieved_posts": [],
         "retrieval_coverage_score": 0.0,
+        "retrieval_stats": {},
         # Retrieve 内部控制字段
         "_retrieve_round": 0,
         "_retrieve_done": False,
@@ -111,13 +132,16 @@ async def run_analysis(
         "_fetched_comment_count": 0,
         "_filtered_comment_count": 0,
         "_need_refetch": False,
-        "_enable_memory": enable_memory if enable_memory is not None else (os.getenv("ENABLE_MEMORY", "false").lower() == "true"),
+        "_enable_memory": enable_memory_flag,
         "_api_type": int(os.getenv("XHS_API_TYPE", "2")),
         "_reuse_strategy": "",
         "_coverage_ratio": 0.0,
         "_reusable_clusters": [],
         "_reuse_ratio": 0.0,
         "_exclude_note_ids": [],
+        "_session_intent_frame": {},
+        "_session_last_run_ref": {},
+        "_last_run_ref": {},
         # 其他阶段
         "screened_items": [],
         "screening_stats": {},
@@ -125,10 +149,14 @@ async def run_analysis(
         "clusters": [],
         "sentiment_summary": {},
         "evidence_ledger": [],
+        "evidence_registry": [],
+        "content_time_analysis": {},
         "_raw_comments_for_clustering": [],
         "memory_context": "",
         "confidence_score": 0.0,
         "limitations": [],
+        "references": [],
+        "report_ir": {},
         "final_answer": "",
         "tool_errors": [],
         "stream_events": [],
@@ -138,8 +166,24 @@ async def run_analysis(
     }
 
     _progress(queue, "start", "分析任务已启动...", 3)
+    session_memory = None
+    run_ref: dict[str, Any] = {}
 
     try:
+        # ── 0. 读取短期会话记忆 ──
+        # 短期记忆只保存上一轮意图帧和 run 快照引用，不保存观点簇本体。
+        if enable_memory_flag and session_id:
+            session_memory = get_session_manager().get_session(session_id)
+            session_context = session_memory.get_context()
+            state["_session_intent_frame"] = session_context.get("last_intent_frame", {})
+            state["_session_last_run_ref"] = session_context.get("last_run_ref", {})
+            if state["_session_intent_frame"] or state["_session_last_run_ref"]:
+                logger.info(
+                    f"[Workflow][SessionMemory] 命中会话记忆: "
+                    f"session_id={session_id}, "
+                    f"last_run={state.get('_session_last_run_ref', {}).get('run_id', '')}"
+                )
+
         # ── 1. Orchestrator Subgraph (ReAct: reasoning → action → observation)
         #     负责意图识别，输出高质量的意图分析结果
         _progress(queue, "orchestrator", "正在分析查询意图...", 8)
@@ -153,13 +197,21 @@ async def run_analysis(
         )
 
         # 输出传递给 Retrieve Agent 的完整意图分析结果
+        ht_metrics = state.get("_hot_topics_metrics", {})
         logger.info(
             f"[Workflow][Orchestrator] Analysis Result:\n"
             f"  ├─ entities: {state.get('product_entities', [])}\n"
             f"  ├─ aliases: {state.get('aliases', [])}\n"
             f"  ├─ key_aspects: {state.get('key_aspects', [])}\n"
             f"  ├─ user_needs: {state.get('user_needs', [])}\n"
-            f"  └─ search_context: {state.get('search_context', {})}"
+            f"  ├─ search_context: {state.get('search_context', {})}\n"
+            f"  ├─ temporal_context: {state.get('temporal_context', {})}\n"
+            f"  └─ hot_topics_metrics: called={ht_metrics.get('called')}, "
+            f"updated={ht_metrics.get('updated')}, "
+            f"intent_changed={ht_metrics.get('intent_changed')}, "
+            f"entities_added={ht_metrics.get('entities_added')}, "
+            f"aspects_added={ht_metrics.get('aspects_added')}, "
+            f"source_topics={ht_metrics.get('source_topics', [])}"
         )
 
         _progress(
@@ -171,9 +223,6 @@ async def run_analysis(
         )
 
         # ── 2. 记忆检索阶段 ──
-        # 使用传入的配置，如果没有则使用默认值（默认关闭）
-        enable_memory_flag = enable_memory if enable_memory is not None else (os.getenv("ENABLE_MEMORY", "false").lower() == "true")
-
         reuse_decision: ReuseDecision | None = None
 
         # 获取 session_id 用于短期记忆
@@ -201,7 +250,8 @@ async def run_analysis(
                     current_query=query,
                     intent=intent,
                     key_aspects=key_aspects,  # NEW: 传入用户关注点
-                    use_llm=True
+                    use_llm=True,
+                    recent_run_ref=state.get("_session_last_run_ref", {})
                 )
 
             if reuse_decision:
@@ -223,6 +273,8 @@ async def run_analysis(
                         state["_reuse_strategy"] = reuse_decision.reuse_strategy
                         state["_coverage_ratio"] = reuse_decision.coverage_ratio
                         state["_reusable_clusters"] = reuse_decision.reusable_clusters
+                        state["_reuse_ratio"] = reuse_decision.coverage_ratio
+                        state["_exclude_note_ids"] = reuse_decision.source_note_ids or []
 
                         progress_msg = f"发现历史记忆（覆盖度 {reuse_decision.coverage_ratio*100:.0f}%），策略：{reuse_decision.reuse_strategy}"
                         logger.info(f"[Workflow][Memory] 发送进度消息: {progress_msg}")
@@ -459,9 +511,11 @@ async def run_analysis(
             "event": "result",
             "data": {
                 "final_answer": state.get("final_answer", ""),
+                "report_ir": state.get("report_ir", {}),
                 "confidence_score": state.get("confidence_score", 0.0),
                 "clusters": state.get("clusters", []),
                 "sentiment_summary": state.get("sentiment_summary", {}),
+                "content_time_analysis": state.get("content_time_analysis", {}),
                 "screened_count": len(state.get("screened_items", [])),
                 "comment_count": len(state.get("retrieved_comments", [])),
                 "limitations": state.get("limitations", []),
@@ -527,7 +581,7 @@ async def run_analysis(
             raise
     finally:
         # ── 在 finally 中保存证据（即使任务被取消也会执行）──
-        if enable_memory and state.get("product_entities"):
+        if enable_memory_flag and state.get("product_entities") and state.get("final_answer"):
             try:
                 from app.memory import get_memory_manager, get_evidence_saver
 
@@ -538,19 +592,19 @@ async def run_analysis(
                 retrieved_comments = state.get("retrieved_comments", [])
                 reuse_strategy = state.get("_reuse_strategy", "none")
 
-                # 调用记忆集成（异步保存证据）
+                intent_frame = _build_intent_frame(state, query)
                 memory_manager = get_memory_manager()
 
-                # 异步保存证据（使用全局线程池）
+                # 先保存证据并拿到 cluster_to_evidence，再更新聚合记忆和 run 快照。
                 evidence_saver = get_evidence_saver()
-                await evidence_saver.save_evidence_async(
-                    entity=entity,
-                    screened_items=screened_items,
-                    clusters=clusters,
-                    retrieved_comments=retrieved_comments
+                evidence_result = evidence_saver.save_evidence_batch(
+                    entity,
+                    screened_items,
+                    clusters,
+                    retrieved_comments
                 )
+                cluster_to_evidence = evidence_result.get("cluster_to_evidence", {})
 
-                # 立即更新记忆（不等证据保存完成）
                 memory_manager.ingest_analysis_result(
                     entity=entity,
                     clusters=clusters,
@@ -560,10 +614,26 @@ async def run_analysis(
                     intent=intent,
                     request_id=run_id,
                     reuse_strategy=reuse_strategy,
-                    skip_evidence_save=True  # NEW: 跳过同步保存，使用异步保存
+                    skip_evidence_save=True,
+                    cluster_to_evidence=cluster_to_evidence,
                 )
 
-                logger.info(f"[Workflow][Memory] 记忆集成完成: entity={entity}")
+                run_ref = memory_manager.save_run_snapshot(
+                    entity=entity,
+                    request_id=run_id,
+                    query=query,
+                    intent_frame=intent_frame,
+                    clusters=clusters,
+                    screened_items=screened_items,
+                    retrieved_comments=retrieved_comments,
+                    final_answer=state.get("final_answer", ""),
+                    report_outline=state.get("_report_outline", {}),
+                    reuse_strategy=reuse_strategy,
+                    cluster_to_evidence=cluster_to_evidence,
+                )
+                state["_last_run_ref"] = run_ref
+
+                logger.info(f"[Workflow][Memory] 记忆集成完成: entity={entity}, run_ref={run_ref.get('run_id', '')}")
 
             except asyncio.CancelledError:
                 logger.warning(f"[Workflow] 证据保存被取消")
@@ -571,35 +641,16 @@ async def run_analysis(
                 logger.warning(f"[Workflow][Memory] 记忆集成失败: {e}")
 
         # ── 更新短期会话记忆 ──
-        if enable_memory and session_id and state.get("product_entities"):
+        if enable_memory_flag and session_id and state.get("product_entities") and run_ref:
             try:
                 session_manager = get_session_manager()
                 session_manager.update_session(
                     session_id=session_id,
-                    query=query,
-                    entity=state.get("product_entities", [""])[0],
-                    intent=state.get("intent", "general"),
-                    note_ids=[p.get("note_id", "") for p in state.get("screened_items", [])],
-                    clusters=state.get("clusters", [])
+                    intent_frame=_build_intent_frame(state, query),
+                    run_ref=run_ref,
                 )
                 logger.info(f"[Workflow][Memory] 已更新短期会话记忆: session_id={session_id}")
             except Exception as e:
                 logger.warning(f"[Workflow][Memory] 更新会话记忆失败: {e}")
-
-        # ── 清理未完成的 asyncio 任务 ──
-        try:
-            tasks = asyncio.all_tasks()
-            current_task = asyncio.current_task()
-
-            cancelled_count = 0
-            for task in tasks:
-                if task is not current_task and not task.done():
-                    task.cancel()
-                    cancelled_count += 1
-
-            if cancelled_count > 0:
-                logger.info(f"[Workflow] 取消了 {cancelled_count} 个未完成的 asyncio 任务")
-        except Exception as e:
-            logger.warning(f"[Workflow] 清理任务失败: {e}")
 
         queue.put_nowait(None)  # 哨兵：通知 SSE 生成器流结束

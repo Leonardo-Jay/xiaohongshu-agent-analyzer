@@ -186,7 +186,7 @@ class XhsMcpClient:
     ) -> list[dict[str, Any]]:
         if self._is_mock:
             from .mock_xhs_data import generate_mock_posts
-            return generate_mock_posts(query, require_num)
+            return generate_mock_posts(query, require_num, sort_type=sort_type)
 
         data = await self._call(
             "search_posts",

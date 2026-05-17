@@ -1,4 +1,5 @@
 """安全中间件：拦截扫描攻击"""
+import os
 import time
 import re
 from collections import defaultdict
@@ -11,6 +12,8 @@ from loguru import logger
 class SecurityMiddleware:
     """安全防护中间件"""
 
+    _TRUE_VALUES = {"1", "true", "yes", "on"}
+
     # 路径白名单（正则表达式）
     ALLOWED_PATHS = [
         r"^/health$",
@@ -19,9 +22,9 @@ class SecurityMiddleware:
         r"^/api/v1/analysis/status/[a-f0-9-]+$",
         r"^/api/v1/analysis/cancel/[a-f0-9-]+$",
         r"^/api/v1/analysis/check-cookie$",
-        r"^/api/v1/analysis/debug/tasks$",
-        r"^/api/v1/analysis/debug/threads$",
-        r"^/api/v1/analysis/debug/fds$",
+        r"^/api/v1/export/pdf$",
+        r"^/api/v1/hotspots/home$",
+        r"^/api/v1/hotspots/refresh$",
         r"^/$",
         r"^/assets/.*$",
         r"^/LOGO2\.ico$",
@@ -73,7 +76,15 @@ class SecurityMiddleware:
         self._blocked_ips: dict[str, float] = {}
 
         # 编译正则表达式
-        self._allowed_paths = [re.compile(p, re.IGNORECASE) for p in self.ALLOWED_PATHS]
+        allowed_paths = list(self.ALLOWED_PATHS)
+        if os.getenv("ENABLE_DEBUG_ROUTES", "false").strip().lower() in self._TRUE_VALUES:
+            allowed_paths.extend([
+                r"^/api/v1/analysis/debug/tasks$",
+                r"^/api/v1/analysis/debug/threads$",
+                r"^/api/v1/analysis/debug/fds$",
+            ])
+
+        self._allowed_paths = [re.compile(p, re.IGNORECASE) for p in allowed_paths]
         self._blocked_paths = [re.compile(p, re.IGNORECASE) for p in self.BLOCKED_PATHS]
         self._attack_patterns = [re.compile(p, re.IGNORECASE) for p in self.ATTACK_PATTERNS]
 

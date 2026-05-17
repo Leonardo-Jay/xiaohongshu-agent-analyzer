@@ -10,5 +10,22 @@ export default defineComponent({
 })
 </script>
 
-<style lang="less" scoped>
+<style lang="less">
+html,
+body,
+#app {
+  width: 100%;
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow-x: hidden;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
 </style>

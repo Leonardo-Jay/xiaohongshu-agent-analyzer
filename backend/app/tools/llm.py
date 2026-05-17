@@ -48,7 +48,8 @@ def _parse_tool_calls(message: dict, finish_reason: str) -> list[ToolCall] | Non
         try:
             args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
         except Exception:
-            args = {}
+            logger.warning(f"[LLM] tool_call JSON 解析失败, name={fn.get('name')}, raw={str(args_raw)[:200]}")
+            continue
         result.append(ToolCall(id=tc.get("id", ""), name=fn.get("name", ""), arguments=args))
     return result or None
 
@@ -82,6 +83,7 @@ class QianfanChatAdapter:
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
+            "max_tokens": 4096,
         }
         if tools:
             payload["tools"] = tools
@@ -99,6 +101,8 @@ class QianfanChatAdapter:
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message") or {}
         finish_reason = choice.get("finish_reason", "stop")
+        if finish_reason == "length":
+            logger.warning(f"[LLM] Qianfan finish_reason=length, 响应被截断, model={self.model}")
         tool_calls = _parse_tool_calls(message, finish_reason)
         content = message.get("content") or ""
         if isinstance(content, list):
@@ -221,6 +225,8 @@ class LongcatChatAdapter:
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message", {})
         finish_reason = choice.get("finish_reason", "stop")
+        if finish_reason == "length":
+            logger.warning(f"[LLM] Longcat finish_reason=length, 响应被截断, model={self.model}")
         tool_calls = _parse_tool_calls(message, finish_reason)
         content = message.get("content") or ""
         return LLMResponse(
@@ -343,6 +349,8 @@ class ModelScopeChatAdapter:
         choice = (data.get("choices") or [{}])[0]
         message = choice.get("message", {})
         finish_reason = choice.get("finish_reason", "stop")
+        if finish_reason == "length":
+            logger.warning(f"[LLM] ModelScope finish_reason=length, 响应被截断, model={self.model}")
         tool_calls = _parse_tool_calls(message, finish_reason)
         content = message.get("content") or ""
         return LLMResponse(

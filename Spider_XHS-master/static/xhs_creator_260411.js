@@ -351,7 +351,7 @@ function seccore_signv2(url_param, json_data) {
     // 构建签名对象
     var signObj = {
         x0: "4.3.2",
-        x1: "xhs-pc-web",
+        x1: "ugc",
         x2: "Windows",
         x3: s,
         x4: "object"
@@ -407,7 +407,7 @@ function XsCommon(a1, xs, xt) {
         x0: "1",
         x1: "4.3.2",
         x2: "Windows",
-        x3: "xhs-pc-web",
+        x3: "ugc",
         x4: "4.84.1",
         x5: a1,
         x6: xt,
