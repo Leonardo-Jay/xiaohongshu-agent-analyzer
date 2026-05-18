@@ -30,7 +30,7 @@ XHS Insight Agent 输入一个产品、品牌或热点问题，就能自动理�
 
 | Web 分析台 | 结构化报告 | MCP Skill |
 | --- | --- | --- |
-| ![Analysis UI](static/image/screenshot-analysis.png) | ![Report Preview](static/image/screenshot-report.png) | ![Skill Preview](static/image/screenshot-skill.png) |
+| ![Analysis UI](static/image/mainwindow.jpg) | ![Report Preview](static/image/reporttest.jpg) | ![Skill Preview](static/image/screenshot-skill.png) |
 
 ## 核心优势
 
