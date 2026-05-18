@@ -1258,9 +1258,13 @@ async function downloadWord() {
 
 /* ── Hero ── */
 .hero {
-  height: 100vh;
-  height: 100dvh;
-  overflow: hidden;
+  --hero-padding-top: clamp(96px, 18dvh, 196px);
+  --hero-padding-bottom: 36px;
+  min-height: 100vh;
+  min-height: 100dvh;
+  height: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -1269,7 +1273,7 @@ async function downloadWord() {
   background-image: linear-gradient(135deg, #DBEAFE 0%, #F3F4F6 60%, #D1FAE5 100%),
     radial-gradient(circle, rgba(30,58,138,0.06) 1px, transparent 1px);
   background-size: auto, 28px 28px;
-  padding: clamp(128px, 30vh, 268px) 20px 36px;
+  padding: var(--hero-padding-top) 20px var(--hero-padding-bottom);
   animation: fadeInUp 0.6s ease both;
 }
 .hero-main {
@@ -1323,7 +1327,7 @@ async function downloadWord() {
   -webkit-backdrop-filter: blur(12px);
   border: 1px solid rgba(255,255,255,0.72);
   border-radius: 8px;
-  padding: 12px;
+  padding: clamp(8px, 1.2dvh, 12px);
   box-shadow: 0 8px 28px rgba(31,41,55,0.08);
   transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
 }
@@ -1372,7 +1376,7 @@ async function downloadWord() {
 }
 .hotspot-item {
   width: 100%;
-  min-height: 36px;
+  min-height: clamp(30px, 4.6dvh, 36px);
   display: flex;
   align-items: center;
   gap: 8px;
@@ -2174,6 +2178,58 @@ async function downloadWord() {
   :deep(.el-dialog) {
     width: calc(100vw - 24px) !important;
     margin-top: 8vh !important;
+  }
+}
+
+@media (min-width: 901px) and (max-height: 760px) {
+  .hero {
+    --hero-padding-top: 72px;
+    --hero-padding-bottom: 28px;
+  }
+  .hero-sub {
+    margin-bottom: 24px;
+  }
+  .hotspot-arc {
+    width: min(1240px, 96vw);
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 14px;
+    height: auto;
+    margin-top: 24px;
+  }
+  .hotspot-block,
+  .hotspot-block:nth-child(n) {
+    position: static;
+    width: 100%;
+    transform: none;
+    transform-origin: center;
+  }
+}
+
+@media (min-width: 901px) and (max-width: 1100px), (min-width: 901px) and (max-height: 680px) {
+  .hero {
+    --hero-padding-top: 64px;
+  }
+  .hero-sub {
+    margin-bottom: 18px;
+  }
+  .hotspot-arc {
+    width: min(760px, 94vw);
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    height: auto;
+    margin-top: 18px;
+  }
+  .hotspot-block,
+  .hotspot-block:nth-child(n) {
+    position: static;
+    width: 100%;
+    transform: none;
+    transform-origin: center;
+  }
+  .hotspot-item {
+    min-height: 30px;
   }
 }
 
