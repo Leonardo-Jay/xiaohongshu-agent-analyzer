@@ -62,6 +62,10 @@ def _preflight_check() -> None:
     check_code = (
         f"import sys; "
         f"sys.path.insert(0, {_SPIDER!r}); "
+        f"from xhs_utils.js_runtime_util import ensure_node_runtime; "
+        f"node_path = ensure_node_runtime() or 'node'; "
+        f"import subprocess; "
+        f"subprocess.run([node_path, '-e', \"require.resolve('crypto-js'); require.resolve('jsdom');\"], check=True, cwd={_SPIDER!r}); "
         f"from apis.xhs_pc_apis import XHS_Apis; "
         f"from xhs_utils.xhs_util import generate_xs_xs_common, generate_xray_traceid; "
         f"generate_xray_traceid(); "
@@ -77,6 +81,13 @@ def _preflight_check() -> None:
     )
     if result.returncode != 0 or "preflight_ok" not in result.stdout:
         stderr = result.stderr.strip() or result.stdout.strip() or "(无输出)"
+        if "Cannot find module 'crypto-js'" in stderr or "Cannot find module 'jsdom'" in stderr:
+            stderr += (
+                "\n\nSpider_XHS-master 的 Node 依赖缺失。请执行：\n"
+                f"  cd {_SPIDER}\n"
+                "  npm install\n"
+                "如果服务器使用 pnpm/yarn，也需要安装 package.json 中的 crypto-js 和 jsdom。"
+            )
         raise RuntimeError(
             f"MCP server 依赖检查失败（exit={result.returncode}）:\n{stderr}"
         )

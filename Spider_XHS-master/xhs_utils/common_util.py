@@ -5,6 +5,9 @@ import hashlib
 import binascii
 import json
 
+from xhs_utils.js_runtime_util import ensure_node_runtime
+ensure_node_runtime()
+
 import execjs
 import requests
 from loguru import logger

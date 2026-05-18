@@ -1,6 +1,9 @@
 import json
 import os
 
+from xhs_utils.js_runtime_util import ensure_node_runtime
+ensure_node_runtime()
+
 import execjs
 
 from xhs_utils.xhs_util import generate_x_b3_traceid, generate_xray_traceid, splice_str

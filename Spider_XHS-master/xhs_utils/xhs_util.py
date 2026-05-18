@@ -5,6 +5,9 @@ import random
 import time
 from urllib.parse import urlencode
 
+from xhs_utils.js_runtime_util import ensure_node_runtime
+ensure_node_runtime()
+
 import execjs
 from xhs_utils.cookie_util import trans_cookies
 
