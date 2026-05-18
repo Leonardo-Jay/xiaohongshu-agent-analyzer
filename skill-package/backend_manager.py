@@ -1,3 +1,10 @@
+"""Legacy FastAPI backend launcher.
+
+The MCP Skill now defaults to direct local workflow execution. Keep this helper
+only for old/manual remote-backend experiments; skill_server.py does not import
+it in normal local mode.
+"""
+
 import subprocess
 import time
 import asyncio

@@ -71,7 +71,8 @@ The system can run as both a web application and an MCP Skill for Claude Desktop
 
 - `analyze_xhs_sentiment`: start a Xiaohongshu analysis from your AI editor.
 - `configure_cookie`: encrypt and store your Xiaohongshu Cookie locally.
-- The Skill checks and starts the backend automatically, consumes the SSE stream, and returns the final Markdown report.
+- `check_xhs_runtime`: check Python, Node, LLM, Cookie, and Xiaohongshu JS dependencies before analysis.
+- By default, the Skill runs the local multi-agent workflow directly. It does not need the Vue frontend or FastAPI backend service.
 
 ### Temporal Retrieval
 
@@ -152,15 +153,17 @@ Analyze iPhone 16 reputation on Xiaohongshu, enable memory reuse.
 
 | Tool | Purpose | Parameters |
 | --- | --- | --- |
-| `analyze_xhs_sentiment` | Run the analysis and return a Markdown report | `query`, `cookie`, `enable_memory` |
+| `check_xhs_runtime` | Check local runtime dependencies | none |
+| `analyze_xhs_sentiment` | Run the multi-agent workflow and return a Markdown report | `query`, `cookie`, `enable_memory`, `return_report_ir`, `save_artifacts` |
 | `configure_cookie` | Configure or update the Xiaohongshu Cookie | `cookie` |
 
 ### Skill Features
 
-- Automatically checks backend health and starts `backend/run.py` when needed.
+- Imports and runs the backend workflow directly, without occupying web ports such as `8000/8030/5173`.
 - Reads Cookie from environment variables or encrypted local storage.
-- Receives progress and results through SSE.
+- Can save Markdown and structured results to local artifacts.
 - Uses a 5-minute default timeout for deeper analysis jobs.
+- Calls the FastAPI backend only when `XHS_SKILL_MODE=remote` is explicitly set.
 
 ## Report System
 
@@ -228,12 +231,21 @@ http://localhost:8001/analysis
 ## Install MCP Skill
 
 ```bash
-cd skill-package
-pip install -r requirements.txt
-python install.py
+cd backend
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+cd ..\Spider_XHS-master
+npm install
+
+cd ..\skill-package
+..\backend\.venv\Scripts\python.exe install.py
 ```
 
+The Skill calls the local multi-agent workflow directly, so it should use the same `backend/.venv` Python that has the backend dependencies installed.
+
 Restart Claude Desktop or Cursor after installation.
+
+After restart, call `check_xhs_runtime` first to verify local dependencies, LLM configuration, Cookie, and Node packages.
 
 Configure Cookie on first use:
 

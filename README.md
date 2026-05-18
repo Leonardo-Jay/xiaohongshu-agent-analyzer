@@ -73,7 +73,8 @@ XHS Insight Agent 输入一个产品、品牌或热点问题，就能自动理�
 
 - `analyze_xhs_sentiment`：在 AI 编辑器里直接发起小红书舆情分析。
 - `configure_cookie`：把小红书 Cookie 加密保存到本地。
-- Skill 会自动检查并启动后端服务，通过 SSE 流式获取结果，最后把完整 Markdown 报告返回给 AI 编辑器。
+- `check_xhs_runtime`：分析前检查 Python、Node、LLM、Cookie 和小红书 JS 依赖。
+- Skill 默认直接运行本地多 Agent 工作流，不需要启动 Vue 前端或 FastAPI 后端服务。
 
 ### 时间语义驱动检索
 
@@ -152,15 +153,17 @@ Evidence
 
 | 工具 | 功能 | 参数 |
 | --- | --- | --- |
-| `analyze_xhs_sentiment` | 发起小红书舆情分析并返回 Markdown 报告 | `query`, `cookie`, `enable_memory` |
+| `check_xhs_runtime` | 检查本地运行环境 | 无 |
+| `analyze_xhs_sentiment` | 直接运行多 Agent 分析并返回 Markdown 报告 | `query`, `cookie`, `enable_memory`, `return_report_ir`, `save_artifacts` |
 | `configure_cookie` | 配置或更新小红书 Cookie | `cookie` |
 
 ### Skill 特性
 
-- 自动检测后端健康状态，未运行时自动启动 `backend/run.py`。
+- 默认直接 import 后端工作流并运行多 Agent，不占用 `8000/8030/5173` 等 Web 端口。
 - Cookie 优先读取环境变量，也可以加密保存到本地。
-- 通过 SSE 接收分析进度和最终报告。
+- 可选保存 Markdown 和结构化结果到本地 artifacts。
 - 默认 5 分钟分析超时，适合较长的小红书检索和评论分析任务。
+- 仅当显式设置 `XHS_SKILL_MODE=remote` 时，才会调用已有 FastAPI 后端。
 
 ## 报告系统
 
@@ -243,20 +246,28 @@ http://localhost:8001/analysis
 
 ## 安装 MCP Skill
 
-### 1. 安装依赖
+### 1. 安装本地运行依赖
 
 ```bash
-cd skill-package
-pip install -r requirements.txt
+cd backend
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+
+cd ..\Spider_XHS-master
+npm install
 ```
+
+Skill 默认直接调用本地多 Agent 工作流，因此 MCP 配置建议使用同一个 `backend/.venv` Python。
 
 ### 2. 自动注册到 Claude Desktop / Cursor
 
 ```bash
-python install.py
+cd ..\skill-package
+..\backend\.venv\Scripts\python.exe install.py
 ```
 
 安装脚本会自动检测系统、定位配置文件、写入 MCP Server 配置。完成后重启 Claude Desktop 或 Cursor。
+
+重启后建议先调用 `check_xhs_runtime`，确认本地依赖、LLM 配置、Cookie 和 Node 依赖都正常。
 
 ### 3. 首次配置 Cookie
 
@@ -294,7 +305,6 @@ my-vue3-vite-project/
 ├─ skill-package/               # Claude Desktop / Cursor MCP Skill
 │  ├─ skill_server.py
 │  ├─ install.py
-│  ├─ backend_manager.py
 │  └─ config.py
 ├─ Spider_XHS-master/           # 小红书抓取依赖项目
 ├─ README.md
