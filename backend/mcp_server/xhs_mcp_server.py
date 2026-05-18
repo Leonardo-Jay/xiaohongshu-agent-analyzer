@@ -19,6 +19,10 @@ _SPIDER = os.path.join(_ROOT, "Spider_XHS-master")
 if _SPIDER not in sys.path:
     sys.path.insert(0, _SPIDER)
 
+# execjs runs bundled JS through Node from the process cwd.  Keep cwd at the
+# spider project root so JS files can resolve ./static/*.js dependencies.
+os.chdir(_SPIDER)
+
 # 让 Node.js 的 require 能找到 Spider_XHS-master/node_modules
 _NODE_MODULES = os.path.join(_SPIDER, "node_modules")
 os.environ["NODE_PATH"] = _NODE_MODULES

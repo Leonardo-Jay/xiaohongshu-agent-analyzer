@@ -63,7 +63,8 @@ def _preflight_check() -> None:
         f"import sys; "
         f"sys.path.insert(0, {_SPIDER!r}); "
         f"from apis.xhs_pc_apis import XHS_Apis; "
-        f"from xhs_utils.xhs_util import generate_xs_xs_common; "
+        f"from xhs_utils.xhs_util import generate_xs_xs_common, generate_xray_traceid; "
+        f"generate_xray_traceid(); "
         f"print('preflight_ok')"
     )
     result = subprocess.run(
@@ -72,6 +73,7 @@ def _preflight_check() -> None:
         text=True,
         timeout=20,
         env=dict(os.environ),
+        cwd=_SPIDER,
     )
     if result.returncode != 0 or "preflight_ok" not in result.stdout:
         stderr = result.stderr.strip() or result.stdout.strip() or "(无输出)"
