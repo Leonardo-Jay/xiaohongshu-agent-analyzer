@@ -32,7 +32,7 @@
         </div>
       </div>
 
-      <div v-if="visibleHotspotGroups.length" class="hotspot-arc">
+      <div v-if="visibleHotspotGroups.length" class="hotspot-arc" :class="hotspotLayoutClass">
         <section
           v-for="(group, gi) in visibleHotspotGroups"
           :key="group.title || gi"
@@ -201,6 +201,7 @@
 import { ref, computed, watch, nextTick, onMounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { CircleCheckFilled, CircleCloseFilled, Loading } from '@element-plus/icons-vue'
+import { getHotspotLayoutClass, getVisibleHotspotGroups } from '../../utils/homeHotspots'
 
 const query = ref('')
 const loading = ref(false)
@@ -211,7 +212,8 @@ const reportBuffer = ref('')
 let hasScrolledToReport = false
 const homeHotspots = ref([])
 const hotspotsStale = ref(false)
-const visibleHotspotGroups = computed(() => homeHotspots.value.slice(0, 4))
+const visibleHotspotGroups = computed(() => getVisibleHotspotGroups(homeHotspots.value))
+const hotspotLayoutClass = computed(() => getHotspotLayoutClass(visibleHotspotGroups.value))
 
 onMounted(() => {
   fetchHomeHotspots()
@@ -1321,7 +1323,10 @@ async function downloadWord() {
 .hotspot-block {
   position: absolute;
   width: min(272px, 24vw);
+  height: 202px;
   min-width: 0;
+  display: flex;
+  flex-direction: column;
   background: rgba(255,255,255,0.78);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
@@ -1355,6 +1360,32 @@ async function downloadWord() {
   transform: rotate(-8deg);
   transform-origin: top left;
 }
+.hotspot-arc.hotspot-count-3 {
+  width: min(980px, 96vw);
+}
+.hotspot-arc.hotspot-count-3 .hotspot-block {
+  width: min(300px, 30vw);
+  height: 202px;
+}
+.hotspot-arc.hotspot-count-3 .hotspot-block:nth-child(1) {
+  left: 4%;
+  top: 20px;
+  transform: rotate(6deg);
+  transform-origin: top center;
+}
+.hotspot-arc.hotspot-count-3 .hotspot-block:nth-child(2) {
+  left: 50%;
+  top: 58px;
+  right: auto;
+  transform: translateX(-50%) rotate(0deg);
+  transform-origin: top center;
+}
+.hotspot-arc.hotspot-count-3 .hotspot-block:nth-child(3) {
+  right: 4%;
+  top: 20px;
+  transform: rotate(-6deg);
+  transform-origin: top center;
+}
 .hotspot-block:hover {
   box-shadow: 0 14px 34px rgba(31,41,55,0.12);
   border-color: rgba(37,99,235,0.24);
@@ -1376,7 +1407,8 @@ async function downloadWord() {
 }
 .hotspot-item {
   width: 100%;
-  min-height: clamp(30px, 4.6dvh, 36px);
+  flex: 0 0 clamp(30px, 4.2dvh, 34px);
+  min-height: 0;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -2041,6 +2073,7 @@ async function downloadWord() {
   .hotspot-block:nth-child(n) {
     position: static;
     width: 100%;
+    height: auto;
     transform: none;
     padding: 12px;
   }
@@ -2051,6 +2084,7 @@ async function downloadWord() {
     margin: 0 auto 10px;
   }
   .hotspot-item {
+    flex-basis: 38px;
     min-height: 38px;
     padding: 0 8px;
   }
@@ -2201,6 +2235,7 @@ async function downloadWord() {
   .hotspot-block:nth-child(n) {
     position: static;
     width: 100%;
+    height: auto;
     transform: none;
     transform-origin: center;
   }
@@ -2225,10 +2260,12 @@ async function downloadWord() {
   .hotspot-block:nth-child(n) {
     position: static;
     width: 100%;
+    height: auto;
     transform: none;
     transform-origin: center;
   }
   .hotspot-item {
+    flex-basis: 30px;
     min-height: 30px;
   }
 }
@@ -2264,9 +2301,11 @@ async function downloadWord() {
     margin-top: 22px;
   }
   .hotspot-block {
+    height: auto;
     padding: 12px 10px;
   }
   .hotspot-item {
+    flex-basis: 40px;
     min-height: 40px;
   }
   .hotspot-text {
