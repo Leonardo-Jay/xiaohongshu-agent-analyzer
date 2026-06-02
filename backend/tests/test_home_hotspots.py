@@ -115,26 +115,52 @@ def test_invalid_llm_json_falls_back_to_rule_ranking(tmp_path):
     assert all(item["query"].endswith("大家怎么看") for item in ranked_items)
 
 
-def test_display_packer_prefers_four_balanced_groups(tmp_path):
+def assert_layout(layout, target, counts):
+    assert layout["target"] == target
+    assert layout["block_count"] == len(counts)
+    assert layout["items_per_block"] == counts
+    assert layout["items_per_group"] == (counts[0] if counts else 0)
+
+
+def test_display_packer_prefers_four_groups_with_five_items(tmp_path):
+    service = make_service(tmp_path)
+    ranked_items = service._fallback_rank_items(make_candidates(service, 20, prefix="Hot topic"))
+
+    groups, layout = service._pack_display_groups(ranked_items)
+
+    assert len(groups) == 4
+    assert_layout(layout, "4x5", [5, 5, 5, 5])
+    assert all(len(group["items"]) == 5 for group in groups)
+
+
+def test_display_packer_degrades_to_four_groups_with_four_items(tmp_path):
     service = make_service(tmp_path)
     ranked_items = service._fallback_rank_items(make_candidates(service, 18))
 
     groups, layout = service._pack_display_groups(ranked_items)
 
     assert len(groups) == 4
-    assert layout["block_count"] == 4
-    assert layout["items_per_block"] == [4, 4, 4, 4]
+    assert_layout(layout, "4x4", [4, 4, 4, 4])
 
 
-def test_display_packer_uses_three_groups_when_four_is_not_possible(tmp_path):
+def test_display_packer_degrades_to_three_groups_with_five_items(tmp_path):
+    service = make_service(tmp_path)
+    ranked_items = service._fallback_rank_items(make_candidates(service, 15, prefix="Trend topic"))
+
+    groups, layout = service._pack_display_groups(ranked_items)
+
+    assert len(groups) == 3
+    assert_layout(layout, "3x5", [5, 5, 5])
+
+
+def test_display_packer_degrades_to_three_groups_with_four_items(tmp_path):
     service = make_service(tmp_path)
     ranked_items = service._fallback_rank_items(make_candidates(service, 12))
 
     groups, layout = service._pack_display_groups(ranked_items)
 
     assert len(groups) == 3
-    assert layout["block_count"] == 3
-    assert layout["items_per_block"] == [4, 4, 4]
+    assert_layout(layout, "3x4", [4, 4, 4])
 
 
 def test_sparse_category_items_are_merged_into_healthy_groups(tmp_path):
@@ -148,7 +174,8 @@ def test_sparse_category_items_are_merged_into_healthy_groups(tmp_path):
     groups, layout = service._pack_display_groups(ranked_items)
 
     assert layout["items_per_block"] == [4, 4, 4, 4]
-    assert all(len(group["items"]) >= 4 for group in groups)
+    assert layout["target"] == "4x4"
+    assert all(len(group["items"]) == 4 for group in groups)
 
 
 def test_refresh_returns_stale_cache_when_not_enough_items(tmp_path):

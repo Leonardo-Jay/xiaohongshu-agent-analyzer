@@ -1319,11 +1319,21 @@ async function downloadWord() {
   position: relative;
   height: 318px;
   margin-top: 34px;
+  --hotspot-block-height: 202px;
+  --hotspot-item-height: clamp(30px, 4.2dvh, 34px);
+}
+.hotspot-arc.hotspot-items-5 {
+  --hotspot-block-height: 232px;
+  --hotspot-item-height: clamp(28px, 3.8dvh, 32px);
+}
+.hotspot-arc.hotspot-items-4 {
+  --hotspot-block-height: 202px;
+  --hotspot-item-height: clamp(30px, 4.2dvh, 34px);
 }
 .hotspot-block {
   position: absolute;
   width: min(272px, 24vw);
-  height: 202px;
+  height: var(--hotspot-block-height);
   min-width: 0;
   display: flex;
   flex-direction: column;
@@ -1361,16 +1371,15 @@ async function downloadWord() {
   transform-origin: top left;
 }
 .hotspot-arc.hotspot-count-3 {
-  width: min(980px, 96vw);
+  width: min(1160px, 98vw);
 }
 .hotspot-arc.hotspot-count-3 .hotspot-block {
-  width: min(300px, 30vw);
-  height: 202px;
+  width: min(300px, 29vw);
 }
 .hotspot-arc.hotspot-count-3 .hotspot-block:nth-child(1) {
-  left: 4%;
-  top: 20px;
-  transform: rotate(6deg);
+  left: 2%;
+  top: 12px;
+  transform: rotate(7deg);
   transform-origin: top center;
 }
 .hotspot-arc.hotspot-count-3 .hotspot-block:nth-child(2) {
@@ -1381,9 +1390,9 @@ async function downloadWord() {
   transform-origin: top center;
 }
 .hotspot-arc.hotspot-count-3 .hotspot-block:nth-child(3) {
-  right: 4%;
-  top: 20px;
-  transform: rotate(-6deg);
+  right: 2%;
+  top: 12px;
+  transform: rotate(-7deg);
   transform-origin: top center;
 }
 .hotspot-block:hover {
@@ -1407,7 +1416,7 @@ async function downloadWord() {
 }
 .hotspot-item {
   width: 100%;
-  flex: 0 0 clamp(30px, 4.2dvh, 34px);
+  flex: 0 0 var(--hotspot-item-height);
   min-height: 0;
   display: flex;
   align-items: center;
@@ -2231,8 +2240,14 @@ async function downloadWord() {
     height: auto;
     margin-top: 24px;
   }
+  .hotspot-arc.hotspot-count-3 {
+    width: min(960px, 96vw);
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
   .hotspot-block,
-  .hotspot-block:nth-child(n) {
+  .hotspot-block:nth-child(n),
+  .hotspot-arc.hotspot-count-3 .hotspot-block,
+  .hotspot-arc.hotspot-count-3 .hotspot-block:nth-child(n) {
     position: static;
     width: 100%;
     height: auto;
@@ -2256,8 +2271,14 @@ async function downloadWord() {
     height: auto;
     margin-top: 18px;
   }
+  .hotspot-arc.hotspot-count-3 {
+    width: min(940px, 94vw);
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
   .hotspot-block,
-  .hotspot-block:nth-child(n) {
+  .hotspot-block:nth-child(n),
+  .hotspot-arc.hotspot-count-3 .hotspot-block,
+  .hotspot-arc.hotspot-count-3 .hotspot-block:nth-child(n) {
     position: static;
     width: 100%;
     height: auto;
@@ -2300,9 +2321,22 @@ async function downloadWord() {
     gap: 12px;
     margin-top: 22px;
   }
+  .hotspot-arc.hotspot-count-3 {
+    width: 100%;
+    max-width: 520px;
+    grid-template-columns: 1fr;
+  }
   .hotspot-block {
     height: auto;
     padding: 12px 10px;
+  }
+  .hotspot-arc.hotspot-count-3 .hotspot-block,
+  .hotspot-arc.hotspot-count-3 .hotspot-block:nth-child(n) {
+    position: static;
+    width: 100%;
+    height: auto;
+    transform: none;
+    transform-origin: center;
   }
   .hotspot-item {
     flex-basis: 40px;

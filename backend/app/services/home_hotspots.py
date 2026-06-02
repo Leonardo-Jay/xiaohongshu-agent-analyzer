@@ -19,8 +19,7 @@ from app.tools.llm import create_llm
 _PLATFORMS = ["douyin", "weibo", "toutiao", "baidu"]
 _MIN_ITEMS = 12
 _MAX_ITEMS = 20
-_PREFERRED_GROUP_ITEMS = 4
-_MAX_GROUP_ITEMS = 5
+_LAYOUT_CANDIDATES: list[tuple[int, int]] = [(4, 5), (4, 4), (3, 5), (3, 4)]
 _MAX_CANDIDATES_FOR_LLM = 80
 _COMPACT_LLM_CANDIDATES = 35
 
@@ -153,7 +152,7 @@ class HomeHotspotsService:
             "stale": True,
             "raw_count": 0,
             "ranking_source": "empty",
-            "layout": {"block_count": 0, "items_per_block": [], "target": "empty"},
+            "layout": {"block_count": 0, "items_per_block": [], "items_per_group": 0, "target": "empty"},
             "groups": [],
         }
 
@@ -395,15 +394,20 @@ class HomeHotspotsService:
         return ranked
 
     def _pack_display_groups(self, ranked_items: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        for group_count in (4, 3):
-            groups = self._pack_for_group_count(ranked_items, group_count)
+        for group_count, items_per_group in _LAYOUT_CANDIDATES:
+            groups = self._pack_for_layout(ranked_items, group_count, items_per_group)
             if groups:
-                return groups, self._layout_for_groups(groups)
-        return [], {"block_count": 0, "items_per_block": [], "target": "empty"}
+                return groups, self._layout_for_groups(groups, items_per_group=items_per_group)
+        return [], {"block_count": 0, "items_per_block": [], "items_per_group": 0, "target": "empty"}
 
-    def _pack_for_group_count(self, ranked_items: list[dict[str, Any]], group_count: int) -> list[dict[str, Any]]:
+    def _pack_for_layout(
+        self,
+        ranked_items: list[dict[str, Any]],
+        group_count: int,
+        items_per_group: int,
+    ) -> list[dict[str, Any]]:
         items = self._dedupe_ranked_items(ranked_items)
-        if len(items) < group_count * _PREFERRED_GROUP_ITEMS:
+        if len(items) < group_count * items_per_group:
             return []
 
         used: set[str] = set()
@@ -418,21 +422,21 @@ class HomeHotspotsService:
                 if self._normalize_category(item.get("category")) == category
                 and _normalize_title(item.get("title", "")) not in used
             ]
-            while len(category_items) >= _PREFERRED_GROUP_ITEMS and len(groups) < group_count:
-                chunk = category_items[:_PREFERRED_GROUP_ITEMS]
+            while len(category_items) >= items_per_group and len(groups) < group_count:
+                chunk = category_items[:items_per_group]
                 self._mark_used(chunk, used)
                 groups.append({
                     "title": self._unique_group_title(category, used_titles),
                     "items": [self._display_item(item) for item in chunk],
                 })
-                category_items = category_items[_PREFERRED_GROUP_ITEMS:]
+                category_items = category_items[items_per_group:]
 
         mixed_title_index = 0
         while len(groups) < group_count:
             pool = [item for item in items if _normalize_title(item.get("title", "")) not in used]
-            if len(pool) < _PREFERRED_GROUP_ITEMS:
+            if len(pool) < items_per_group:
                 break
-            chunk = pool[:_PREFERRED_GROUP_ITEMS]
+            chunk = pool[:items_per_group]
             self._mark_used(chunk, used)
             title = self._mixed_group_title(chunk, mixed_title_index)
             mixed_title_index += 1
@@ -443,7 +447,7 @@ class HomeHotspotsService:
 
         if len(groups) != group_count:
             return []
-        if any(len(group["items"]) < _PREFERRED_GROUP_ITEMS or len(group["items"]) > _MAX_GROUP_ITEMS for group in groups):
+        if any(len(group["items"]) != items_per_group for group in groups):
             return []
         return groups
 
@@ -547,13 +551,22 @@ class HomeHotspotsService:
         for item in items:
             used.add(_normalize_title(item.get("title", "")))
 
-    def _layout_for_groups(self, groups: list[dict[str, Any]]) -> dict[str, Any]:
+    def _layout_for_groups(self, groups: list[dict[str, Any]], *, items_per_group: int | None = None) -> dict[str, Any]:
         counts = [len(group.get("items", [])) for group in groups]
         block_count = len(groups)
+        if items_per_group is None:
+            items_per_group = counts[0] if counts and len(set(counts)) == 1 else 0
+        if block_count == 0:
+            target = "empty"
+        elif items_per_group:
+            target = f"{block_count}x{items_per_group}"
+        else:
+            target = f"{block_count}-balanced"
         return {
             "block_count": block_count,
             "items_per_block": counts,
-            "target": f"{block_count}x{counts[0]}" if counts and len(set(counts)) == 1 else f"{block_count}-balanced",
+            "items_per_group": items_per_group,
+            "target": target,
         }
 
     def _log_ranking_failure(

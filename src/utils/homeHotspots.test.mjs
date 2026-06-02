@@ -17,10 +17,22 @@ test('filters legacy sparse groups before homepage display', () => {
   ])
 
   assert.deepEqual(visible.map(item => item.title), ['a', 'b', 'c'])
-  assert.equal(getHotspotLayoutClass(visible), 'hotspot-count-3')
+  assert.equal(getHotspotLayoutClass(visible), 'hotspot-count-3 hotspot-items-4')
 })
 
-test('keeps at most four healthy groups for the arc layout', () => {
+test('returns layout class for four groups with five items', () => {
+  const visible = getVisibleHotspotGroups([
+    group('a', 5),
+    group('b', 5),
+    group('c', 5),
+    group('d', 5),
+  ])
+
+  assert.equal(visible.length, 4)
+  assert.equal(getHotspotLayoutClass(visible), 'hotspot-count-4 hotspot-items-5')
+})
+
+test('returns layout class for four groups with four items', () => {
   const visible = getVisibleHotspotGroups([
     group('a', 4),
     group('b', 4),
@@ -30,7 +42,29 @@ test('keeps at most four healthy groups for the arc layout', () => {
   ])
 
   assert.equal(visible.length, 4)
-  assert.equal(getHotspotLayoutClass(visible), 'hotspot-count-4')
+  assert.equal(getHotspotLayoutClass(visible), 'hotspot-count-4 hotspot-items-4')
+})
+
+test('returns layout class for three groups with five items', () => {
+  const visible = getVisibleHotspotGroups([
+    group('a', 5),
+    group('b', 5),
+    group('c', 5),
+  ])
+
+  assert.equal(visible.length, 3)
+  assert.equal(getHotspotLayoutClass(visible), 'hotspot-count-3 hotspot-items-5')
+})
+
+test('returns layout class for three groups with four items', () => {
+  const visible = getVisibleHotspotGroups([
+    group('a', 4),
+    group('b', 4),
+    group('c', 4),
+  ])
+
+  assert.equal(visible.length, 3)
+  assert.equal(getHotspotLayoutClass(visible), 'hotspot-count-3 hotspot-items-4')
 })
 
 test('hides hotspot area when fewer than three healthy groups exist', () => {
@@ -41,5 +75,5 @@ test('hides hotspot area when fewer than three healthy groups exist', () => {
   ])
 
   assert.deepEqual(visible, [])
-  assert.equal(getHotspotLayoutClass(visible), 'hotspot-count-0')
+  assert.equal(getHotspotLayoutClass(visible), 'hotspot-count-0 hotspot-items-0')
 })
