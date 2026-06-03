@@ -49,6 +49,12 @@ from app.agents.retrieve_agent import build_retrieve_graph
 from app.agents.screen_agent import build_screen_graph
 from app.models.schemas import GraphState
 from app.tools.mcp_client import XhsMcpClient, XhsMcpClientPool
+from app.tools.xhs_apihz import fetch_posts_detail_batch, is_apihz_configured
+from app.tools.xhs_search_replay import (
+    XhsSearchReplayError,
+    is_xhs_search_replay_cookie,
+    load_xhs_search_replay_fixture,
+)
 from app.utils.daily_audit_log import append_audit_log
 from app.utils.memory_retrieval import get_memory_retrieval, ReuseDecision
 from app.utils.session_memory import get_session_manager
@@ -86,6 +92,59 @@ def _build_intent_frame(state: GraphState, raw_query: str) -> dict[str, Any]:
     }
 
 
+def _build_replay_retrieve_output(state: GraphState, queue: asyncio.Queue) -> dict[str, Any]:
+    if not is_apihz_configured():
+        raise XhsSearchReplayError(
+            "APIHZ_NOT_CONFIGURED_FOR_REPLAY",
+            "链接回放模式需要配置 XHS_APIHZ_ID / XHS_APIHZ_KEY，才能根据历史 note_url 补全帖子正文",
+        )
+
+    fixture = load_xhs_search_replay_fixture()
+    posts = fixture["posts"]
+    fixture_name = fixture["fixture_name"]
+    logger.info(
+        "[Workflow][Replay] cookie=-2: 使用历史搜索链接回放 fixture={} posts={}",
+        fixture_name,
+        len(posts),
+    )
+    logger.info("[Workflow][Replay] 强制 api_type=1，后续使用 apihz 补全正文")
+    for post in posts:
+        logger.info("[Retrieve][ReplayCapture] note_url={}", post.get("note_url", ""))
+
+    _progress(queue, "retrieve", f"使用历史搜索链接回放 fixture={fixture_name}，跳过小红书实时检索", 25)
+    _progress(queue, "retrieve", f"已加载 {len(posts)} 篇历史帖子链接", 28)
+
+    keywords = []
+    if fixture.get("source_query"):
+        keywords.append(fixture["source_query"])
+
+    return {
+        "retrieved_posts": posts,
+        "_used_keywords": keywords,
+        "_retrieve_round": 1,
+        "_retrieve_done": True,
+        "_target_posts": len(posts),
+        "_exclude_note_ids": state.get("_exclude_note_ids", []),
+        "retrieval_coverage_score": 1.0,
+        "retrieval_stats": {
+            "replay_mode": True,
+            "fixture_name": fixture_name,
+            "fixture_path": fixture.get("path", ""),
+            "source_query": fixture.get("source_query", ""),
+            "captured_at": fixture.get("captured_at", ""),
+            "post_count": len(posts),
+            "sort_types_used": sorted({p.get("sort_type_used") for p in posts if p.get("sort_type_used") is not None}),
+            "time_filter_applied": False,
+            "time_filter_relaxed": False,
+            "time_filtered_count": 0,
+            "time_parseable_count": 0,
+        },
+        "search_attempts": state.get("search_attempts", 0) + 1,
+        "_critical_errors": [],
+        "_abort_analysis": False,
+    }
+
+
 async def run_analysis(
     query: str,
     run_id: str,
@@ -95,7 +154,13 @@ async def run_analysis(
     session_id: str | None = None,
 ) -> None:
     """在后台 task 中执行全流程，结果/错误通过 queue 发送。"""
-    enable_memory_flag = enable_memory if enable_memory is not None else (os.getenv("ENABLE_MEMORY", "false").lower() == "true")
+    replay_mode = is_xhs_search_replay_cookie(cookie)
+    if replay_mode and enable_memory is None:
+        enable_memory_flag = False
+        logger.info("[Workflow][Replay] cookie=-2: 默认关闭记忆复用，确保执行 Retrieve/Screen/Analyze")
+    else:
+        enable_memory_flag = enable_memory if enable_memory is not None else (os.getenv("ENABLE_MEMORY", "false").lower() == "true")
+    initial_api_type = 1 if replay_mode else int(os.getenv("XHS_API_TYPE", "2"))
     state: GraphState = {
         "request_id": run_id,
         "session_id": session_id or "",
@@ -133,7 +198,8 @@ async def run_analysis(
         "_filtered_comment_count": 0,
         "_need_refetch": False,
         "_enable_memory": enable_memory_flag,
-        "_api_type": int(os.getenv("XHS_API_TYPE", "2")),
+        "_api_type": initial_api_type,
+        "_xhs_search_replay_mode": replay_mode,
         "_reuse_strategy": "",
         "_coverage_ratio": 0.0,
         "_reusable_clusters": [],
@@ -381,45 +447,62 @@ async def run_analysis(
 
         else:
             # 增量更新或从头开始：执行 Retrieve/Screen/Analyze
-            api_type = int(os.getenv("XHS_API_TYPE", "2"))  # 默认为 2
+            api_type = 1 if replay_mode else int(os.getenv("XHS_API_TYPE", "2"))  # 默认为 2
+            state["_api_type"] = api_type
 
             # ── 2. Retrieve Subgraph ──
-            if reuse_decision and reuse_decision.reuse_strategy == "incremental":
-                # 增量模式：缩减爬取量
-                target_posts = max(3, int(7 * (1 - reuse_decision.coverage_ratio * 0.7)))
-                state["_target_posts"] = target_posts
-                logger.info(f"[Workflow] 增量更新模式：目标 {target_posts} 篇帖子")
-                _progress(queue, "retrieve", f"增量模式：爬取 {target_posts} 篇帖子", 25)
+            if replay_mode:
+                retrieve_output = _build_replay_retrieve_output(state, queue)
+                state = {**state, **retrieve_output}
+                logger.info(
+                    f"[Workflow][Retrieve] replay finished: posts={len(state.get('retrieved_posts', []))}, "
+                    f"fixture={state.get('retrieval_stats', {}).get('fixture_name', '')}"
+                )
             else:
-                # 从头开始：正常流程
-                # 注：不设置 state["_target_posts"]，由 retrieve_agent 使用默认值 _MIN_POSTS=7
-                _progress(queue, "retrieve", "正在检索相关帖子...", 25)
+                if reuse_decision and reuse_decision.reuse_strategy == "incremental":
+                    # 增量模式：缩减爬取量
+                    target_posts = max(3, int(7 * (1 - reuse_decision.coverage_ratio * 0.7)))
+                    state["_target_posts"] = target_posts
+                    logger.info(f"[Workflow] 增量更新模式：目标 {target_posts} 篇帖子")
+                    _progress(queue, "retrieve", f"增量模式：爬取 {target_posts} 篇帖子", 25)
+                else:
+                    # 从头开始：正常流程
+                    # 注：不设置 state["_target_posts"]，由 retrieve_agent 使用默认值 _MIN_POSTS=7
+                    _progress(queue, "retrieve", "正在检索相关帖子...", 25)
 
-            # 执行检索（固定使用 1 个连接，避免并发爬取导致封号）
-            # 传入 api_type：当 api_type=1 时跳过详情拉取，后续用 apihz.cn 补全
-            async with XhsMcpClientPool(size=1, cookie=cookie) as retrieve_pool:
-                config = {"configurable": {"pool": retrieve_pool, "queue": queue, "api_type": api_type}}
-                retrieve_output = await _retrieve_app.ainvoke(state, config=config)
-            state = {**state, **retrieve_output}
-            logger.info(
-                f"[Workflow][Retrieve] finished: posts={len(state.get('retrieved_posts', []))}, "
-                f"attempts={state.get('search_attempts', 0)}, "
-                f"coverage={state.get('retrieval_coverage_score', 0.0):.2f}"
-            )
-            _progress(queue, "retrieve", f"检索到 {len(state.get('retrieved_posts', []))} 篇帖子", 28)
+                # 执行检索（固定使用 1 个连接，避免并发爬取导致封号）
+                # 传入 api_type：当 api_type=1 时跳过详情拉取，后续用 apihz.cn 补全
+                async with XhsMcpClientPool(size=1, cookie=cookie) as retrieve_pool:
+                    config = {"configurable": {"pool": retrieve_pool, "queue": queue, "api_type": api_type}}
+                    retrieve_output = await _retrieve_app.ainvoke(state, config=config)
+                state = {**state, **retrieve_output}
+                logger.info(
+                    f"[Workflow][Retrieve] finished: posts={len(state.get('retrieved_posts', []))}, "
+                    f"attempts={state.get('search_attempts', 0)}, "
+                    f"coverage={state.get('retrieval_coverage_score', 0.0):.2f}"
+                )
+                _progress(queue, "retrieve", f"检索到 {len(state.get('retrieved_posts', []))} 篇帖子", 28)
 
             # ── apihz.cn 补全正文（仅 api_type=1，在 Screen 之前！）──
             if api_type == 1:
                 _progress(queue, "retrieve", "正在获取完整帖子正文...", 30)
                 try:
-                    from app.tools.xhs_apihz import fetch_posts_detail_batch, is_apihz_configured
-
                     if not is_apihz_configured():
+                        if replay_mode:
+                            raise XhsSearchReplayError(
+                                "APIHZ_NOT_CONFIGURED_FOR_REPLAY",
+                                "链接回放模式需要配置 XHS_APIHZ_ID / XHS_APIHZ_KEY，才能根据历史 note_url 补全帖子正文",
+                            )
                         logger.warning("[Workflow] apihz.cn 未配置，使用截断的帖子正文")
                     else:
                         retrieved_posts = state.get("retrieved_posts", [])
                         note_urls = [p.get("note_url", "") for p in retrieved_posts]
                         full_details = await fetch_posts_detail_batch(note_urls)
+                        if replay_mode and not full_details:
+                            raise XhsSearchReplayError(
+                                "APIHZ_DETAIL_EMPTY_FOR_REPLAY",
+                                "链接回放模式已加载历史 note_url，但 apihz 未返回任何帖子详情；请检查 fixture 链接是否过期",
+                            )
 
                         # 更新 retrieved_posts 中的 desc 为完整正文
                         detail_map = {d.get("note_id"): d for d in full_details if d.get("note_id")}
@@ -430,7 +513,19 @@ async def run_analysis(
                                 post["title"] = detail_map[note_id].get("title", post.get("title", ""))
 
                         logger.info(f"[Workflow] apihz.cn 获取了 {len(full_details)} 篇帖子的完整正文")
+                        if replay_mode and not any(str(post.get("desc") or "").strip() for post in retrieved_posts):
+                            raise XhsSearchReplayError(
+                                "APIHZ_DETAIL_EMPTY_FOR_REPLAY",
+                                "链接回放模式调用 apihz 后没有得到可用于分析的帖子正文；请检查 fixture 的完整 note_url",
+                            )
+                except XhsSearchReplayError:
+                    raise
                 except Exception as e:
+                    if replay_mode:
+                        raise XhsSearchReplayError(
+                            "APIHZ_DETAIL_EMPTY_FOR_REPLAY",
+                            f"链接回放模式调用 apihz 失败: {e}",
+                        ) from e
                     logger.warning(f"[Workflow] apihz.cn 调用失败: {e}，使用截断的帖子正文")
 
             # ── 3. Screen Subgraph ──
@@ -548,6 +643,28 @@ async def run_analysis(
             queue.put_nowait({
                 "event": "error",
                 "data": {"code": "COOKIE_EXPIRED", "message": "小红书 Cookie 已过期，请重新配置"},
+            })
+        elif isinstance(e, XhsSearchReplayError):
+            logger.error(
+                "[Workflow][Replay] run_id={} FAILED: code={}, message={}",
+                run_id,
+                e.code,
+                e.message,
+            )
+            append_audit_log(
+                "analysis_workflow_failed",
+                run_id=run_id,
+                query=query,
+                status="failed",
+                error_message=f"{e.code}: {e.message}",
+                retrieved_post_count=len(state.get("retrieved_posts", [])),
+                screened_count=len(state.get("screened_items", [])),
+                comment_count=len(state.get("retrieved_comments", [])),
+                cluster_count=len(state.get("clusters", [])),
+            )
+            queue.put_nowait({
+                "event": "error",
+                "data": {"code": e.code, "message": e.message},
             })
         else:
             try:

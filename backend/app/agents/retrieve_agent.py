@@ -73,6 +73,13 @@ async def _execute_retrieve_tool(
                     existing_ids.add(note_id)
                     new_posts.append(p)
                     added += 1
+                    logger.info(
+                        "[Retrieve][ReplayCapture] keyword={} sort={} note_id={} note_url={}",
+                        keyword,
+                        sort_type,
+                        note_id,
+                        p.get("note_url", ""),
+                    )
 
             logger.info(f"[Retrieve][FC] search_posts '{keyword}': sort={sort_type}, found={len(posts)}, new_added={added}")
             return {"status": "ok", "keyword": keyword, "sort_type": sort_type, "found": len(posts), "new_added": added}

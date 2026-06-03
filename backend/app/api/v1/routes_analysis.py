@@ -21,6 +21,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from app.graph.workflow import run_analysis
 from app.models.schemas import AnalysisRequest
+from app.tools.xhs_search_replay import is_xhs_full_mock_cookie, is_xhs_search_replay_cookie
 from app.utils.daily_audit_log import append_audit_log
 
 router = APIRouter(prefix="/api/v1/analysis", tags=["analysis"])
@@ -298,12 +299,16 @@ async def check_cookie(cookie: str | None = Query(None)):
     if not xhs_cookie or not xhs_cookie.strip():
         return JSONResponse({"valid": False, "source": "none"})
     source = "param" if cookie else "env"
+    if is_xhs_search_replay_cookie(cookie):
+        return JSONResponse({"valid": True, "source": source, "mode": "search_replay"})
+    if is_xhs_full_mock_cookie(cookie):
+        return JSONResponse({"valid": True, "source": source, "mode": "full_mock"})
     # 解析 cookie 字段，检查关键字段是否存在
     sep = "; " if "; " in xhs_cookie else ";"
     fields = {k.strip(): v for k, v in
               (part.split("=", 1) if "=" in part else (part, "") for part in xhs_cookie.split(sep))}
     valid = bool(fields.get("web_session") and fields.get("a1"))
-    return JSONResponse({"valid": valid, "source": source})
+    return JSONResponse({"valid": valid, "source": source, "mode": "cookie"})
 
 
 def _ensure_debug_access(request: Request) -> None:
