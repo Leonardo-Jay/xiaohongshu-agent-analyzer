@@ -9,11 +9,13 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from copy import deepcopy
 from typing import Any, Literal
 
+import httpx
 from loguru import logger
 from pydantic import ValidationError
 
@@ -23,14 +25,15 @@ from app.prompts.templates import (
     SYNTHESIS_MODIFY_OUTLINE_PROMPT,
     SYNTHESIS_PLAN_OUTLINE_PROMPT,
     SYNTHESIS_REPORT_IR_PROMPT,
+    SYNTHESIS_REPORT_IR_RAW_REPAIR_PROMPT,
     SYNTHESIS_REPORT_IR_REPAIR_PROMPT,
     SYNTHESIS_REPORT_PROMPT,
 )
 from app.reports.renderer import render_markdown
 from app.tools.llm import create_llm
 
-# 规划用严谨模型，生成报告用略带感情色彩的模型
-_llm_plan = create_llm(temperature=0.1)
+# 规划与 Report IR JSON 生成更容易出现长响应，给非流式调用更宽松的超时。
+_llm_plan = create_llm(temperature=0.1, timeout=180.0, max_tokens=8192)
 _llm_report = create_llm(temperature=0.3)
 
 _MAX_SYNTHESIS_ROUNDS = 3
@@ -183,6 +186,127 @@ def _extract_json_object(text: str) -> dict[str, Any]:
     raise ValueError("Unable to extract Report IR JSON object")
 
 
+def _raw_report_excerpt(text: str, limit: int = 1000) -> str:
+    raw = str(text or "").replace("\x00", "")
+    if len(raw) <= limit:
+        return raw
+    return raw[:limit]
+
+
+def _raw_report_tail(text: str, limit: int = 1000) -> str:
+    raw = str(text or "").replace("\x00", "")
+    if len(raw) <= limit:
+        return raw
+    return raw[-limit:]
+
+
+def _log_report_ir_raw(
+    *,
+    stage: str,
+    raw_text: str,
+    context: dict[str, Any],
+    finish_reason: str = "",
+    prompt_chars: int = 0,
+    error: Exception | None = None,
+) -> None:
+    raw = str(raw_text or "")
+    log_payload = {
+        "stage": stage,
+        "finish_reason": finish_reason or "",
+        "raw_chars": len(raw),
+        "prompt_chars": prompt_chars,
+        "clusters": len(context.get("clusters", []) or []),
+        "posts": int(context.get("post_count", 0) or 0),
+        "comments": int(context.get("comment_count", 0) or 0),
+        "citations": len(context.get("citations", []) or []),
+        "has_open_brace": "{" in raw,
+        "has_close_brace": "}" in raw,
+        "raw_prefix": _raw_report_excerpt(raw, 800),
+        "raw_suffix": _raw_report_tail(raw, 800),
+    }
+    if error is not None:
+        log_payload["error_type"] = type(error).__name__
+        log_payload["error"] = str(error)
+    logger.info(
+        "[Synthesis][ReportIR] raw diagnostics: {}",
+        json.dumps(log_payload, ensure_ascii=False),
+    )
+
+
+async def _invoke_report_ir_llm(
+    prompt: str,
+    *,
+    context: dict[str, Any],
+    stage: str,
+) -> tuple[str, str]:
+    """Use non-streaming completion first; stream only as transport fallback."""
+    try:
+        response = await _llm_plan.ainvoke(prompt)
+        raw_text = _llm_plan._normalize_text(response.content)
+        finish_reason = getattr(response, "finish_reason", "") or ""
+        _log_report_ir_raw(
+            stage=stage,
+            raw_text=raw_text,
+            context=context,
+            finish_reason=finish_reason,
+            prompt_chars=len(prompt),
+        )
+        return raw_text, finish_reason
+    except (httpx.TimeoutException, httpx.RequestError, asyncio.TimeoutError) as exc:
+        logger.warning(
+            "[Synthesis][ReportIR] {} 非流式调用失败，尝试流式兜底: type={}, error={!r}",
+            stage,
+            type(exc).__name__,
+            exc,
+        )
+        buffer = ""
+        async for chunk in _llm_plan.astream(prompt):
+            buffer += chunk
+        raw_text = _llm_plan._normalize_text(buffer)
+        _log_report_ir_raw(
+            stage=f"{stage}_stream_fallback",
+            raw_text=raw_text,
+            context=context,
+            finish_reason="stream_fallback",
+            prompt_chars=len(prompt),
+            error=exc,
+        )
+        return raw_text, "stream_fallback"
+
+
+async def _repair_unparseable_report_ir(
+    *,
+    raw_text: str,
+    parse_error: Exception,
+    context: dict[str, Any],
+    prompt_context: dict[str, Any],
+) -> dict[str, Any]:
+    logger.warning(
+        "[Synthesis][ReportIR] JSON 提取失败，进入 raw-text repair: type={}, error={!r}, raw_chars={}",
+        type(parse_error).__name__,
+        parse_error,
+        len(str(raw_text or "")),
+    )
+    repair_prompt = SYNTHESIS_REPORT_IR_RAW_REPAIR_PROMPT.format(
+        parse_error=f"{type(parse_error).__name__}: {parse_error}",
+        allowed_cluster_ids=", ".join(context.get("allowed_cluster_ids", [])),
+        allowed_citation_ids=", ".join(context.get("allowed_citation_ids", [])),
+        report_context_json=json.dumps(prompt_context, ensure_ascii=False, indent=2),
+        raw_chars=len(str(raw_text or "")),
+        raw_prefix=_raw_report_excerpt(raw_text, 2000),
+        raw_suffix=_raw_report_tail(raw_text, 2000),
+    )
+    repair_text, _ = await _invoke_report_ir_llm(
+        repair_prompt,
+        context=context,
+        stage="raw_text_repair",
+    )
+    try:
+        return _extract_json_object(repair_text)
+    except ValueError as exc:
+        raise ValueError(f"Report IR JSON 提取失败，raw-text repair 也失败: {exc}") from exc
+
+
 def _truncate_text(value: str, limit: int = _MAX_QUOTE_CHARS) -> str:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if len(text) <= limit:
@@ -256,18 +380,136 @@ def _build_report_metadata(state: GraphState) -> ReportMetadata:
     )
 
 
+def _collect_raw_report_evidence(state: GraphState, limit: int = 10) -> list[dict[str, Any]]:
+    screened_items = state.get("screened_items", []) or []
+    post_by_id = {item.get("note_id"): item for item in screened_items if isinstance(item, dict)}
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def add_row(
+        *,
+        evidence_id: str,
+        content: str,
+        source_title: str,
+        source_url: str,
+        source_type: str,
+    ) -> None:
+        text = re.sub(r"\s+", " ", str(content or "")).strip()
+        if not text:
+            return
+        key = (source_url or evidence_id, text)
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append({
+            "evidence_id": evidence_id or f"raw_{len(rows):03d}",
+            "content": text,
+            "source_title": source_title or "用户原话",
+            "source_url": source_url or "",
+            "source_type": source_type,
+        })
+
+    for item in state.get("evidence_registry", []) or []:
+        if not isinstance(item, dict):
+            continue
+        add_row(
+            evidence_id=str(item.get("evidence_id") or ""),
+            content=str(item.get("content") or ""),
+            source_title=str(item.get("source_title") or ""),
+            source_url=str(item.get("source_url") or item.get("source_note_url") or ""),
+            source_type=str(item.get("source_type") or "evidence"),
+        )
+        if len(rows) >= limit:
+            return rows
+
+    for index, comment in enumerate(state.get("retrieved_comments", []) or []):
+        if not isinstance(comment, dict):
+            continue
+        post = post_by_id.get(comment.get("note_id"), {})
+        add_row(
+            evidence_id=str(comment.get("comment_id") or f"comment_{index:03d}"),
+            content=str(comment.get("content") or ""),
+            source_title=str(post.get("title") or comment.get("nickname") or "用户评论"),
+            source_url=str(post.get("note_url") or ""),
+            source_type="comment",
+        )
+        if len(rows) >= limit:
+            return rows
+
+    for index, post in enumerate(screened_items):
+        if not isinstance(post, dict):
+            continue
+        title = str(post.get("title") or "").strip()
+        desc = str(post.get("desc") or "").strip()
+        if rows and not desc:
+            continue
+        content = f"{title}\n\n{desc}" if title and desc else (title or desc)
+        add_row(
+            evidence_id=str(post.get("note_id") or f"post_{index:03d}"),
+            content=content,
+            source_title=title or "帖子正文",
+            source_url=str(post.get("note_url") or ""),
+            source_type="post_body",
+        )
+        if len(rows) >= limit:
+            return rows
+
+    return rows
+
+
+def _infer_report_sentiment(text: str) -> str:
+    value = str(text or "")
+    if any(keyword in value for keyword in ("不好", "不行", "失望", "质疑", "担心", "问题", "缺点", "翻车", "劝退", "差")):
+        return "负面"
+    if any(keyword in value for keyword in ("不错", "好用", "推荐", "惊喜", "满意", "提升", "优秀", "稳定", "强")):
+        return "正面"
+    return "中立"
+
+
+def _fallback_report_topic(item: dict[str, Any], index: int) -> str:
+    title = str(item.get("source_title") or "").strip()
+    if title and title not in {"用户原话", "用户评论", "帖子正文"}:
+        return f"样本反馈{index + 1}：{title[:24]}"
+    quote = _truncate_text(str(item.get("content") or ""), limit=24)
+    return f"样本反馈{index + 1}：{quote or '原始证据'}"
+
+
+def _build_report_fallback_clusters(state: GraphState) -> list[dict[str, Any]]:
+    clusters = []
+    for index, item in enumerate(_collect_raw_report_evidence(state, limit=min(3, _MAX_IR_CLUSTERS))):
+        quote = _truncate_text(str(item.get("content") or ""))
+        if not quote:
+            continue
+        clusters.append({
+            "topic": _fallback_report_topic(item, index),
+            "sentiment": _infer_report_sentiment(quote),
+            "count": 1,
+            "evidence_ids": [item.get("evidence_id", "")],
+            "evidence_quotes": [quote],
+            "source_title": item.get("source_title", "用户原话"),
+            "source_note_url": item.get("source_url", ""),
+            "primary_aspects": [],
+            "sub_aspects": [],
+            "fallback_generated": True,
+        })
+    return clusters
+
+
 def _build_overview_chart(state: GraphState) -> ChartSpec | None:
     post_count = len(state.get("screened_items", []))
     comment_count = len(state.get("retrieved_comments", []))
     clusters = state.get("clusters", []) or []
     summary = state.get("sentiment_summary", {}) or {}
+    raw_evidence_count = len(_collect_raw_report_evidence(state, limit=20))
 
-    if not post_count and not comment_count and not clusters and not summary:
+    if not post_count and not comment_count and not clusters and not summary and not raw_evidence_count:
         return None
 
     top_clusters = sorted(clusters, key=_cluster_count, reverse=True)[:3]
     top_topics = "、".join(str(item.get("topic") or "") for item in top_clusters if item.get("topic"))
     quote_count = sum(len(item.get("evidence_quotes", []) or item.get("quotes", []) or []) for item in clusters)
+    if not quote_count:
+        quote_count = raw_evidence_count
     sentiment_text = " / ".join(
         f"{label}{summary.get(label)}"
         for label in ("正面", "负面", "中立")
@@ -301,6 +543,18 @@ def _build_overview_chart(state: GraphState) -> ChartSpec | None:
             "value": f"{quote_count} 条用户原话",
             "insight": "证据越集中，越适合支撑问题机制分析；但仍需结合样本来源判断代表性。",
         })
+    if not any("口径" in str(row.get("label", "")) or "样本" in str(row.get("label", "")) for row in data):
+        data.append({
+            "label": "统计口径",
+            "value": "当前抓取样本",
+            "insight": "报告基于当前检索与筛选结果生成，适合识别方向，不代表全网比例。",
+        })
+    if len(data) < 3:
+        data.append({
+            "label": "统计口径",
+            "value": "当前样本倾向参考",
+            "insight": "样本量或观点聚类不足时，结构化报告会优先保留证据来源和样本限制说明。",
+        })
 
     return ChartSpec(id="chart_overview", type="table", title="舆情指标概览", data=data)
 
@@ -308,6 +562,13 @@ def _build_overview_chart(state: GraphState) -> ChartSpec | None:
 def _build_report_context(state: GraphState) -> dict[str, Any]:
     """Build compact, token-bounded context and deterministic citation registry."""
     clusters = (state.get("clusters", []) or [])[:_MAX_IR_CLUSTERS]
+    if not clusters:
+        clusters = _build_report_fallback_clusters(state)[:_MAX_IR_CLUSTERS]
+        if clusters:
+            logger.warning(
+                "[Synthesis][ReportIR] clusters 为空，已从原始证据恢复 {} 个上下文观点簇",
+                len(clusters),
+            )
     citations: list[Citation] = []
     seen_quotes: set[tuple[str, str]] = set()
     cluster_citation_ids: dict[str, list[str]] = {}
@@ -417,6 +678,20 @@ def _build_report_context(state: GraphState) -> dict[str, Any]:
                 quote=quote,
             )
 
+    if not citations and compact_clusters:
+        raw_evidence = _collect_raw_report_evidence(state, limit=len(compact_clusters))
+        for idx, item in enumerate(raw_evidence):
+            row = compact_clusters[idx % len(compact_clusters)]
+            add_citation(
+                cluster_id=row["id"],
+                topic=row["topic"],
+                sentiment=row["sentiment"],
+                source_title=str(item.get("source_title") or ""),
+                source_url=str(item.get("source_url") or ""),
+                quote=str(item.get("content") or ""),
+                evidence_id=str(item.get("evidence_id") or ""),
+            )
+
     for row in compact_clusters:
         row["citation_ids"] = cluster_citation_ids.get(row["id"], [])
 
@@ -489,6 +764,10 @@ def _normalize_report_ir_payload(raw_data: dict[str, Any]) -> dict[str, Any]:
                 continue
             section["type"] = _normalize_section_type(section, idx)
 
+            cids = section.get("cluster_ids")
+            if isinstance(cids, list):
+                section["cluster_ids"] = [str(c) for c in cids]
+
             blocks = section.get("blocks")
             if isinstance(blocks, list):
                 for block in blocks:
@@ -500,6 +779,9 @@ def _normalize_report_ir_payload(raw_data: dict[str, Any]) -> dict[str, Any]:
                         _BLOCK_TYPE_ALIASES,
                         default_type,
                     )
+                    bids = block.get("citation_ids")
+                    if isinstance(bids, list):
+                        block["citation_ids"] = [str(b) for b in bids]
 
     charts = payload.get("charts")
     if isinstance(charts, list):
@@ -684,6 +966,10 @@ def _report_ir_issues(report: ReportIR, context: dict[str, Any]) -> list[str]:
         if not section.blocks:
             issues.append(f"章节「{section.title}」没有内容块")
         if section.type == "analysis":
+            is_content_time_section = "内容事件演化" in section.title
+            min_subheading_count = 1 if is_content_time_section else 2
+            min_paragraph_chars = 80 if is_content_time_section else _MIN_ANALYSIS_PARAGRAPH_CHARS
+
             if _is_generic_analysis_title(section.title):
                 issues.append(f"分析章节标题「{section.title}」过于标签化，需要改成洞察型判断句")
 
@@ -691,8 +977,8 @@ def _report_ir_issues(report: ReportIR, context: dict[str, Any]) -> list[str]:
                 idx for idx, block in enumerate(section.blocks)
                 if block.type == "subheading" and block.text.strip()
             ]
-            if len(subheading_indexes) < 2:
-                issues.append(f"分析章节「{section.title}」至少需要 2 个洞察型 subheading")
+            if len(subheading_indexes) < min_subheading_count:
+                issues.append(f"分析章节「{section.title}」至少需要 {min_subheading_count} 个洞察型 subheading")
 
             for sub_idx in subheading_indexes:
                 subheading = section.blocks[sub_idx]
@@ -710,18 +996,19 @@ def _report_ir_issues(report: ReportIR, context: dict[str, Any]) -> list[str]:
                     issues.append(f"小标题「{subheading.text}」后缺少分析段落")
                     continue
                 paragraph_text = re.sub(r"\s+", "", next_paragraph.text)
-                if len(paragraph_text) < _MIN_ANALYSIS_PARAGRAPH_CHARS:
+                if len(paragraph_text) < min_paragraph_chars:
                     issues.append(
-                        f"小标题「{subheading.text}」后的分析段落过短，至少需要 {_MIN_ANALYSIS_PARAGRAPH_CHARS} 个中文字符"
+                        f"小标题「{subheading.text}」后的分析段落过短，至少需要 {min_paragraph_chars} 个中文字符"
                     )
-                if context.get("allowed_citation_ids") and not next_paragraph.citation_ids:
-                    issues.append(f"小标题「{subheading.text}」后的分析段落缺少 citation_ids")
-                elif not _contains_quote_fragment(
-                    next_paragraph.text,
-                    next_paragraph.citation_ids,
-                    context,
-                ):
-                    issues.append(f"小标题「{subheading.text}」后的分析段落没有自然嵌入用户原话")
+                if context.get("allowed_citation_ids"):
+                    if not next_paragraph.citation_ids:
+                        issues.append(f"小标题「{subheading.text}」后的分析段落缺少 citation_ids")
+                    elif not _contains_quote_fragment(
+                        next_paragraph.text,
+                        next_paragraph.citation_ids,
+                        context,
+                    ):
+                        issues.append(f"小标题「{subheading.text}」后的分析段落没有自然嵌入用户原话")
 
         if section.type == "analysis" and context.get("allowed_citation_ids"):
             has_citation = any(block.citation_ids for block in section.blocks)
@@ -767,8 +1054,21 @@ async def _generate_report_ir(state: GraphState) -> ReportIR:
         report_context_json=json.dumps(prompt_context, ensure_ascii=False, indent=2),
     )
 
-    resp = await _llm_plan.ainvoke(prompt)
-    raw_data = _extract_json_object(resp.content)
+    raw_text, _ = await _invoke_report_ir_llm(
+        prompt,
+        context=context,
+        stage="initial",
+    )
+    try:
+        raw_data = _extract_json_object(raw_text)
+    except ValueError as exc:
+        raw_data = await _repair_unparseable_report_ir(
+            raw_text=raw_text,
+            parse_error=exc,
+            context=context,
+            prompt_context=prompt_context,
+        )
+
     try:
         report = _sanitize_report_ir(
             _coerce_report_ir(raw_data, metadata=metadata, citations=citations),
@@ -789,8 +1089,20 @@ async def _generate_report_ir(state: GraphState) -> ReportIR:
         allowed_citation_ids=", ".join(context.get("allowed_citation_ids", [])),
         report_ir_json=json.dumps(raw_data, ensure_ascii=False, indent=2),
     )
-    repair_resp = await _llm_plan.ainvoke(repair_prompt)
-    repaired_data = _extract_json_object(repair_resp.content)
+    repair_text, _ = await _invoke_report_ir_llm(
+        repair_prompt,
+        context=context,
+        stage="validation_repair",
+    )
+    try:
+        repaired_data = _extract_json_object(repair_text)
+    except ValueError as exc:
+        repaired_data = await _repair_unparseable_report_ir(
+            raw_text=repair_text,
+            parse_error=exc,
+            context=context,
+            prompt_context=prompt_context,
+        )
     try:
         repaired = _sanitize_report_ir(
             _coerce_report_ir(repaired_data, metadata=metadata, citations=citations),
@@ -1079,7 +1391,21 @@ async def node_execute_report(state: GraphState, config: dict) -> dict[str, Any]
             "final_answer": final_answer,
         }
     except Exception as e:
-        logger.warning(f"[Synthesis][ReportIR] 结构化报告生成失败，回退到旧 Markdown 流程: {e}")
+        logger.error(
+            "[Synthesis][ReportIR] 结构化报告生成失败，回退到旧 Markdown 流程: "
+            "type={}, error={!r}, clusters={}, posts={}, comments={}".format(
+                type(e).__name__,
+                e,
+                len(state.get("clusters", []) or []),
+                post_count,
+                len(state.get("retrieved_comments", []) or []),
+            )
+        )
+        if queue:
+            queue.put_nowait({
+                "event": "progress",
+                "data": {"message": "结构化报告生成遇到波动，回退旧 Markdown 流程", "progress": 82},
+            })
         legacy = await _legacy_execute_markdown_report(state, config)
         return {
             **legacy,

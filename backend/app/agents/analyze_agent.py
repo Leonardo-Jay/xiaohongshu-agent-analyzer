@@ -164,6 +164,109 @@ def _attach_cluster_sources(clusters: list[dict[str, Any]], registry: list[dict[
             cluster["source_title"] = first.get("source_title", "无标题")
 
 
+def _load_json_payload(text: str) -> dict[str, Any]:
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", str(text or "").strip())
+    data = json.loads(cleaned)
+    if not isinstance(data, dict):
+        raise ValueError("LLM 聚类结果不是 JSON object")
+    return data
+
+
+def _clip_evidence_quote(text: str, limit: int = 120) -> str:
+    value = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(value) <= limit:
+        return value
+    return value[:limit].rstrip() + "..."
+
+
+def _infer_evidence_sentiment(text: str) -> str:
+    value = str(text or "")
+    negative_keywords = (
+        "不好", "不行", "失望", "吐槽", "质疑", "担心", "问题", "缺点", "翻车",
+        "不稳定", "卡", "慢", "差", "贵", "劝退", "负面",
+    )
+    positive_keywords = (
+        "不错", "好用", "推荐", "惊喜", "满意", "提升", "强", "优秀", "稳定",
+        "流畅", "省心", "正面",
+    )
+    if any(keyword in value for keyword in negative_keywords):
+        return "负面"
+    if any(keyword in value for keyword in positive_keywords):
+        return "正面"
+    return "中立"
+
+
+def _fallback_topic_from_evidence(item: dict[str, Any], index: int) -> str:
+    title = str(item.get("source_title") or "").strip()
+    if title and title != "无标题":
+        return f"样本反馈{index + 1}：{title[:24]}"
+    quote = _clip_evidence_quote(item.get("content", ""), limit=24)
+    return f"样本反馈{index + 1}：{quote or '原始证据'}"
+
+
+def _build_fallback_clusters_from_evidence(
+    evidence_registry: list[dict[str, Any]],
+    *,
+    max_clusters: int = 3,
+) -> list[dict[str, Any]]:
+    clusters: list[dict[str, Any]] = []
+    for index, item in enumerate(evidence_registry[:max_clusters]):
+        quote = _clip_evidence_quote(item.get("content", ""))
+        if not quote:
+            continue
+        clusters.append({
+            "topic": _fallback_topic_from_evidence(item, index),
+            "sentiment": _infer_evidence_sentiment(quote),
+            "count": 1,
+            "evidence_ids": [item["evidence_id"]],
+            "evidence_quotes": [quote],
+            "source_note_url": item.get("source_url", ""),
+            "source_title": item.get("source_title", "无标题"),
+            "primary_aspects": [],
+            "sub_aspects": [],
+            "synonym_aspects": [],
+            "fallback_generated": True,
+        })
+    return clusters
+
+
+def _cluster_failure_result(
+    *,
+    error_type: str,
+    message: str,
+    exc: Exception | None,
+    existing_clusters: list[dict[str, Any]],
+    evidence_registry: list[dict[str, Any]],
+    raw_comment_count: int,
+) -> dict[str, Any]:
+    fallback_clusters = [] if existing_clusters else _build_fallback_clusters_from_evidence(evidence_registry)
+    clusters = existing_clusters or fallback_clusters
+    error: dict[str, Any] = {
+        "stage": "analyze",
+        "error_type": error_type,
+        "message": message,
+        "raw_comment_count": raw_comment_count,
+        "evidence_count": len(evidence_registry),
+        "fallback_cluster_count": len(fallback_clusters),
+    }
+    if exc is not None:
+        error["exception_type"] = type(exc).__name__
+        error["error_repr"] = repr(exc)
+
+    logger.warning(
+        "[Analyze][ClusterOpinions] 使用结构化兜底观点簇: type={}, raw_comments={}, evidence={}, fallback_clusters={}",
+        error_type,
+        raw_comment_count,
+        len(evidence_registry),
+        len(fallback_clusters),
+    )
+    return {
+        "clusters": clusters,
+        "evidence_registry": evidence_registry,
+        "_recoverable_errors": [error],
+    }
+
+
 async def _fetch_comments_with_retry(
     client, note_url: str, note_id: str, max_retries: int = 2
 ) -> list[dict]:
@@ -430,8 +533,17 @@ async def node_cluster_opinions(state: GraphState, config: dict) -> dict[str, An
 
     try:
         resp = await asyncio.wait_for(_llm.ainvoke(prompt), timeout=60.0)
-        data = json.loads(resp.content)
+        data = _load_json_payload(resp.content)
         clusters = data.get("clusters", [])
+        if not clusters:
+            return _cluster_failure_result(
+                error_type="cluster_generation_empty",
+                message="LLM 聚类返回空观点簇",
+                exc=None,
+                existing_clusters=existing_clusters,
+                evidence_registry=evidence_registry,
+                raw_comment_count=len(raw_comments),
+            )
         clusters = _assign_evidence_ids_to_clusters(clusters, evidence_registry)
         _attach_cluster_sources(clusters, evidence_registry)
 
@@ -453,12 +565,26 @@ async def node_cluster_opinions(state: GraphState, config: dict) -> dict[str, An
 
         return {"clusters": clusters, "evidence_registry": evidence_registry}
 
-    except asyncio.TimeoutError:
-        logger.warning("[Analyze][ClusterOpinions] 聚类超时 60 秒")
-        return {"clusters": existing_clusters}
+    except asyncio.TimeoutError as e:
+        logger.warning("[Analyze][ClusterOpinions] 聚类超时 60 秒: type={}, error={!r}", type(e).__name__, e)
+        return _cluster_failure_result(
+            error_type="cluster_generation_timeout",
+            message="聚类 LLM 调用超过 60 秒",
+            exc=e,
+            existing_clusters=existing_clusters,
+            evidence_registry=evidence_registry,
+            raw_comment_count=len(raw_comments),
+        )
     except Exception as e:
-        logger.warning(f"[Analyze][ClusterOpinions] 聚类失败：{e}")
-        return {"clusters": existing_clusters}
+        logger.warning("[Analyze][ClusterOpinions] 聚类失败: type={}, error={!r}", type(e).__name__, e)
+        return _cluster_failure_result(
+            error_type="cluster_generation_failed",
+            message="聚类 LLM 调用或 JSON 解析失败",
+            exc=e,
+            existing_clusters=existing_clusters,
+            evidence_registry=evidence_registry,
+            raw_comment_count=len(raw_comments),
+        )
 
 
 async def node_validate_clusters(state: GraphState, config: dict) -> dict[str, Any]:
@@ -686,21 +812,34 @@ async def node_analyze_content_time(state: GraphState, config: dict) -> dict[str
 
 
 async def node_check_quality(state: GraphState) -> dict[str, Any]:
-    # 如果已经标记完成（如 api_type=1 模式），直接返回
-    if state.get("_analyze_done"):
-        logger.info("[Analyze][CheckQuality] 已标记完成，跳过质量检查")
-        return {
-            "_analyze_done": True,
-            "_need_refetch": False,
-            "sentiment_summary": state.get("sentiment_summary", {}),
-            "evidence_ledger": state.get("evidence_ledger", []),
-        }
-
     comment_count = state.get("_fetched_comment_count", 0)
     clusters = state.get("clusters", [])
     round_num = state.get("_analyze_round", 0)
     unique_opinion_count = len(clusters)
     has_conflict = _has_conflicting_sentiment(clusters)
+
+    sentiment_counts: dict[str, int] = {}
+    for cl in clusters:
+        s = cl.get("sentiment", "中立")
+        sentiment_counts[s] = sentiment_counts.get(s, 0) + cl.get("count", 1)
+
+    evidence_ledger = [
+        {"topic": cl.get("topic"), "sentiment": cl.get("sentiment"),
+         "quotes": cl.get("evidence_quotes", []), "source": cl.get("source_title", "")}
+        for cl in clusters
+    ]
+
+    # api_type=1 会在正文转评论后提前标记完成，但仍需要保留聚类后的摘要物料。
+    if state.get("_analyze_done"):
+        logger.info(
+            f"[Analyze][CheckQuality] 已标记完成，保留质量摘要: 评论={comment_count}, 观点簇={unique_opinion_count}"
+        )
+        return {
+            "_analyze_done": True,
+            "_need_refetch": False,
+            "sentiment_summary": sentiment_counts or state.get("sentiment_summary", {}),
+            "evidence_ledger": evidence_ledger or state.get("evidence_ledger", []),
+        }
 
     should_stop = False
     stop_reason = ""
@@ -721,17 +860,6 @@ async def node_check_quality(state: GraphState) -> dict[str, Any]:
     if state.get("_need_refetch") and round_num < _MAX_ANALYZE_ROUNDS:
         should_stop = False
         stop_reason = "观点簇相关性不足，需要爬取更多帖子"
-
-    sentiment_counts: dict[str, int] = {}
-    for cl in clusters:
-        s = cl.get("sentiment", "中立")
-        sentiment_counts[s] = sentiment_counts.get(s, 0) + cl.get("count", 1)
-
-    evidence_ledger = [
-        {"topic": cl.get("topic"), "sentiment": cl.get("sentiment"),
-         "quotes": cl.get("evidence_quotes", []), "source": cl.get("source_title", "")}
-        for cl in clusters
-    ]
 
     logger.info(
         f"[Analyze][CheckQuality] Round {round_num}: "

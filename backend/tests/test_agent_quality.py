@@ -3,7 +3,10 @@ import json
 from io import BytesIO
 
 import pytest
-from pypdf import PdfReader
+try:
+    from pypdf import PdfReader
+except ModuleNotFoundError:
+    PdfReader = None
 
 from app.agents import analyze_agent, orchestrator_agent, retrieve_agent, screen_agent, synthesis_agent
 from app.memory.memory_types import ConsensusCluster, EntityMemory
@@ -12,7 +15,8 @@ from app.reports.html_renderer import render_report_html
 from app.reports.pdf_renderer import PdfRendererUnavailable, render_report_pdf
 from app.reports.renderer import render_markdown
 from app.tools.current_time import CurrentTimeClient
-from app.tools.llm import ToolCall
+from app.tools.llm import LLMResponse, LongcatChatAdapter, ModelScopeChatAdapter, QianfanChatAdapter, ToolCall
+import app.tools.llm as llm_tools
 from app.tools.tool_schemas import SEARCH_POSTS_SCHEMA
 from app.utils.memory_retrieval import MemoryRetrieval
 from app.utils.temporal import infer_temporal_context, normalize_temporal_context
@@ -208,6 +212,63 @@ def test_evidence_registry_preserves_post_and_comment_time_fields():
     assert registry[1]["source_url"] == "https://example.com/n1"
 
 
+def test_cluster_opinions_falls_back_to_evidence_clusters_when_llm_fails(monkeypatch):
+    class FailingLLM:
+        async def ainvoke(self, *args, **kwargs):
+            raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(analyze_agent, "_llm", FailingLLM())
+
+    result = run_async(
+        analyze_agent.node_cluster_opinions(
+            {
+                "user_query_raw": "Claude Opus 能力怎么看",
+                "screened_items": [{
+                    "note_id": "n1",
+                    "title": "Claude 使用体验",
+                    "note_url": "https://example.com/n1",
+                }],
+                "_raw_comments_for_clustering": [
+                    {
+                        "comment_id": "__post_body__n1",
+                        "content": "复杂任务里推理能力不错，但稳定性还有人质疑。",
+                        "note_id": "n1",
+                        "nickname": "[博主]",
+                    }
+                ],
+                "clusters": [],
+            },
+            {},
+        )
+    )
+
+    assert result["clusters"]
+    assert result["clusters"][0]["fallback_generated"] is True
+    assert result["clusters"][0]["evidence_ids"] == ["ev_000"]
+    assert result["evidence_registry"][0]["content"].startswith("复杂任务")
+    assert result["_recoverable_errors"][0]["error_type"] == "cluster_generation_timeout"
+
+
+def test_check_quality_preserves_summary_when_analyze_is_already_done():
+    result = run_async(
+        analyze_agent.node_check_quality({
+            "_analyze_done": True,
+            "_fetched_comment_count": 1,
+            "clusters": [{
+                "topic": "稳定性质疑",
+                "sentiment": "负面",
+                "count": 1,
+                "evidence_quotes": ["稳定性还有人质疑。"],
+                "source_title": "Claude 使用体验",
+            }],
+        })
+    )
+
+    assert result["_analyze_done"] is True
+    assert result["sentiment_summary"] == {"负面": 1}
+    assert result["evidence_ledger"][0]["topic"] == "稳定性质疑"
+
+
 def test_content_time_analysis_sanitizer_limits_events_and_banned_terms():
     payload = {
         "available": True,
@@ -271,6 +332,30 @@ def test_report_ir_quality_guard_requires_content_time_section():
     issues = synthesis_agent._report_ir_issues(report, context)
 
     assert any("内容事件演化" in issue for issue in issues)
+
+
+def test_report_context_recovers_clusters_and_citations_from_raw_comments():
+    context = synthesis_agent._build_report_context({
+        "user_query_raw": "Claude Opus 能力怎么看",
+        "screened_items": [{
+            "note_id": "n1",
+            "title": "Claude 使用体验",
+            "note_url": "https://example.com/n1",
+        }],
+        "retrieved_comments": [
+            {
+                "comment_id": "__post_body__n1",
+                "content": "复杂任务里推理能力不错，但稳定性还有人质疑。",
+                "note_id": "n1",
+            }
+        ],
+        "clusters": [],
+    })
+
+    assert context["allowed_cluster_ids"] == ["cl_0"]
+    assert context["allowed_citation_ids"] == ["cit_0"]
+    assert context["clusters"][0]["citation_ids"] == ["cit_0"]
+    assert len(context["default_charts"][0]["data"]) >= 3
 
 
 def test_orchestrator_reasoning_falls_back_when_llm_fails(monkeypatch):
@@ -589,6 +674,124 @@ def _sample_report_ir() -> ReportIR:
     )
 
 
+def _sample_report_ir_payload() -> dict:
+    payload = _sample_report_ir().model_dump()
+    payload.pop("metadata", None)
+    payload.pop("citations", None)
+    return payload
+
+
+def _report_ir_generation_state() -> dict:
+    return {
+        "user_query_raw": "PhoneX 续航怎么样",
+        "intent": "quality_issue",
+        "screened_items": [{
+            "note_id": "n1",
+            "title": "PhoneX 续航体验",
+            "note_url": "https://example.com/n1",
+        }],
+        "retrieved_comments": [{
+            "comment_id": "c1",
+            "content": "游戏半小时掉电很快。",
+            "note_id": "n1",
+        }],
+        "clusters": [{
+            "topic": "续航焦虑",
+            "sentiment": "负面",
+            "count": 3,
+            "evidence_quotes": ["游戏半小时掉电很快。"],
+            "source_title": "用户原话",
+            "source_note_url": "https://example.com/n1",
+        }],
+        "confidence_score": 0.78,
+        "limitations": ["样本量仍然偏小"],
+    }
+
+
+class _FakeReportLLM:
+    def __init__(self, responses: list[str]):
+        self.responses = responses
+        self.calls: list[str] = []
+
+    async def ainvoke(self, prompt):
+        self.calls.append(prompt)
+        index = len(self.calls) - 1
+        content = self.responses[index] if index < len(self.responses) else self.responses[-1]
+        return LLMResponse(content=content, finish_reason="stop")
+
+    async def astream(self, prompt):
+        raise AssertionError("ReportIR should not use streaming unless non-streaming transport fails")
+        yield ""
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        return text.strip()
+
+
+def test_llm_stream_uses_configured_max_tokens(monkeypatch):
+    captured_payloads = []
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            yield "data: [DONE]"
+
+    class FakeStream:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *args):
+            return False
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, headers=None, json=None):
+            captured_payloads.append(json)
+            return FakeStream()
+
+    monkeypatch.setattr(llm_tools.httpx, "AsyncClient", FakeAsyncClient)
+
+    adapters = [
+        QianfanChatAdapter(
+            api_url="https://example.com/qianfan",
+            bearer_token="token",
+            model="m",
+            max_tokens=8192,
+        ),
+        LongcatChatAdapter(
+            api_url="https://example.com/longcat",
+            api_key="token",
+            model="m",
+            max_tokens=8192,
+        ),
+        ModelScopeChatAdapter(
+            api_url="https://example.com/modelscope",
+            api_key="token",
+            model="m",
+            max_tokens=8192,
+        ),
+    ]
+
+    async def collect_all():
+        for adapter in adapters:
+            async for _ in adapter.astream("prompt"):
+                pass
+
+    run_async(collect_all())
+
+    assert [payload["max_tokens"] for payload in captured_payloads] == [8192, 8192, 8192]
+
+
 def test_report_ir_renderer_outputs_metadata_charts_and_citations():
     markdown = render_markdown(_sample_report_ir())
 
@@ -643,6 +846,9 @@ def test_report_renderers_output_content_time_section_as_regular_ir_section():
 
 
 def test_report_pdf_renderer_outputs_pdf_with_annotations():
+    if PdfReader is None:
+        pytest.skip("pypdf is not installed")
+
     report = _sample_report_ir()
     report.citations[0].source_url = "https://example.com/post/1"
 
@@ -700,6 +906,64 @@ def test_report_ir_quality_guard_rejects_thin_template_analysis():
     assert any("标签化" in issue for issue in issues)
     assert any("过短" in issue for issue in issues)
     assert any("没有自然嵌入用户原话" in issue for issue in issues)
+
+
+def test_report_ir_quality_guard_does_not_require_quote_embedding_without_citations():
+    report = _sample_report_ir()
+    context = {
+        "allowed_citation_ids": [],
+        "allowed_cluster_ids": ["cl_0"],
+        "required_cluster_ids": [],
+        "citations": [],
+    }
+
+    issues = synthesis_agent._report_ir_issues(report, context)
+
+    assert not any("没有自然嵌入用户原话" in issue for issue in issues)
+
+
+def test_report_ir_content_time_section_allows_single_event_subheading():
+    raw_payload = _sample_report_ir().model_dump()
+    raw_payload["sections"].insert(
+        1,
+        {
+            "id": "sec_content_time",
+            "title": "内容事件演化",
+            "type": "analysis",
+            "cluster_ids": ["cl_0"],
+            "blocks": [
+                {"type": "subheading", "text": "续航落差先成为负面讨论入口"},
+                {
+                    "type": "paragraph",
+                    "text": (
+                        "用户先用游戏半小时掉电很快。来描述高负载场景里的续航落差，"
+                        "随后这种体验不满会被扩展成对整机可靠性的判断；在样本很少时，"
+                        "这一事件更适合被写成单一演化节点，而不是硬拆成多个并不存在的阶段。"
+                    ),
+                    "citation_ids": ["cit_0"],
+                },
+            ],
+        },
+    )
+    report = ReportIR.model_validate(raw_payload)
+    context = {
+        "allowed_citation_ids": ["cit_0"],
+        "allowed_cluster_ids": ["cl_0"],
+        "required_cluster_ids": [],
+        "citations": [{"id": "cit_0", "quote": "游戏半小时掉电很快。"}],
+        "content_time_analysis": {
+            "available": True,
+            "events": [{
+                "title": "续航落差先成为负面讨论入口",
+                "citation_ids": ["cit_0"],
+            }],
+        },
+    }
+
+    issues = synthesis_agent._report_ir_issues(report, context)
+
+    assert not any("内容事件演化」至少需要 2 个洞察型 subheading" in issue for issue in issues)
+    assert not any("续航落差先成为负面讨论入口" in issue and "120" in issue for issue in issues)
 
 
 def test_report_ir_quality_guard_rejects_thin_summary_and_count_only_chart():
@@ -764,6 +1028,38 @@ def test_report_renderer_outputs_overview_table_with_insight_column():
     assert "| 样本规模 | 3 篇帖子 / 12 条评论 | 样本量偏小" in markdown
     assert "<th>解读</th>" in html
     assert "该议题直接影响重度用户的购买信心" in html
+
+
+def test_report_ir_unparseable_raw_text_uses_raw_repair(monkeypatch):
+    payload = _sample_report_ir_payload()
+    fake_llm = _FakeReportLLM([
+        "这是一段不是 JSON 的结构化报告草稿，长度足够长，但无法被 JSON 解析器直接抽取。",
+        json.dumps(payload, ensure_ascii=False),
+    ])
+    monkeypatch.setattr(synthesis_agent, "_llm_plan", fake_llm)
+    monkeypatch.setattr(synthesis_agent, "_report_ir_issues", lambda report, context: [])
+
+    report = run_async(synthesis_agent._generate_report_ir(_report_ir_generation_state()))
+
+    assert report.title == "PhoneX 续航舆情分析报告"
+    assert len(fake_llm.calls) == 2
+    assert "原始输出前段" in fake_llm.calls[1]
+
+
+def test_report_ir_schema_validation_still_uses_repair_prompt(monkeypatch):
+    payload = _sample_report_ir_payload()
+    fake_llm = _FakeReportLLM([
+        json.dumps({"version": "1.0", "sections": []}, ensure_ascii=False),
+        json.dumps(payload, ensure_ascii=False),
+    ])
+    monkeypatch.setattr(synthesis_agent, "_llm_plan", fake_llm)
+    monkeypatch.setattr(synthesis_agent, "_report_ir_issues", lambda report, context: [])
+
+    report = run_async(synthesis_agent._generate_report_ir(_report_ir_generation_state()))
+
+    assert report.title == "PhoneX 续航舆情分析报告"
+    assert len(fake_llm.calls) == 2
+    assert "校验问题" in fake_llm.calls[1]
 
 
 def test_synthesis_execute_returns_report_ir_and_compatible_markdown(monkeypatch):

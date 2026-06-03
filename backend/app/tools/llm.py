@@ -63,13 +63,16 @@ class QianfanChatAdapter:
         model: str,
         temperature: float = 0,
         timeout: float = 120.0,
+        max_tokens: int = 4096,
     ) -> None:
         self.api_url = api_url
         self.bearer_token = bearer_token
         self.model = model
         self.temperature = temperature
         self.timeout = timeout
+        self.max_tokens = max_tokens
 
+    @retry_llm
     async def ainvoke(
         self,
         prompt: str | list[dict],
@@ -83,7 +86,7 @@ class QianfanChatAdapter:
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
-            "max_tokens": 4096,
+            "max_tokens": self.max_tokens,
         }
         if tools:
             payload["tools"] = tools
@@ -130,6 +133,7 @@ class QianfanChatAdapter:
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": self.temperature,
                     "stream": True,
+                    "max_tokens": self.max_tokens,
                 }
                 headers = {
                     "Content-Type": "application/json",
@@ -186,13 +190,16 @@ class LongcatChatAdapter:
         model: str,
         temperature: float = 0,
         timeout: float = 120.0,
+        max_tokens: int = 4096,
     ) -> None:
         self.api_url = api_url
         self.api_key = api_key
         self.model = model
         self.temperature = temperature
         self.timeout = timeout
+        self.max_tokens = max_tokens
 
+    @retry_llm
     async def ainvoke(
         self,
         prompt: str | list[dict],
@@ -206,7 +213,7 @@ class LongcatChatAdapter:
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
-            "max_tokens": 4096,
+            "max_tokens": self.max_tokens,
         }
         if tools:
             payload["tools"] = tools
@@ -248,7 +255,7 @@ class LongcatChatAdapter:
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": self.temperature,
                     "stream": True,
-                    "max_tokens": 4096,
+                    "max_tokens": self.max_tokens,
                 }
                 headers = {
                     "Content-Type": "application/json",
@@ -310,13 +317,16 @@ class ModelScopeChatAdapter:
         model: str,
         temperature: float = 0,
         timeout: float = 120.0,
+        max_tokens: int = 4096,
     ) -> None:
         self.api_url = api_url if api_url.endswith("/chat/completions") else f"{api_url.rstrip('/')}/chat/completions"
         self.api_key = api_key
         self.model = model
         self.temperature = temperature
         self.timeout = timeout
+        self.max_tokens = max_tokens
 
+    @retry_llm
     async def ainvoke(
         self,
         prompt: str | list[dict],
@@ -330,7 +340,7 @@ class ModelScopeChatAdapter:
             "model": self.model,
             "messages": messages,
             "temperature": self.temperature,
-            "max_tokens": 4096,
+            "max_tokens": self.max_tokens,
         }
         if tools:
             payload["tools"] = tools
@@ -372,7 +382,7 @@ class ModelScopeChatAdapter:
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": self.temperature,
                     "stream": True,
-                    "max_tokens": 4096,
+                    "max_tokens": self.max_tokens,
                 }
                 headers = {
                     "Content-Type": "application/json",
@@ -426,7 +436,7 @@ class ModelScopeChatAdapter:
         return text
 
 
-def create_llm(*, temperature: float = 0, model: str | None = None, **kwargs: Any) -> QianfanChatAdapter | LongcatChatAdapter | ModelScopeChatAdapter:
+def create_llm(*, temperature: float = 0, model: str | None = None, max_tokens: int = 4096, **kwargs: Any) -> QianfanChatAdapter | LongcatChatAdapter | ModelScopeChatAdapter:
     """创建聊天补全适配器（根据 LLM_PROVIDER 动态分发）。"""
     provider = os.getenv("LLM_PROVIDER", "qianfan").strip().lower()
     timeout = float(kwargs.pop("timeout", 120.0))
@@ -441,6 +451,7 @@ def create_llm(*, temperature: float = 0, model: str | None = None, **kwargs: An
             model=model_name,
             temperature=temperature,
             timeout=timeout,
+            max_tokens=max_tokens,
         )
     elif provider == "modelscope":
         api_url = (os.getenv("MODELSCOPE_BASE_URL") or "https://api-inference.modelscope.cn/v1").strip()
@@ -452,6 +463,7 @@ def create_llm(*, temperature: float = 0, model: str | None = None, **kwargs: An
             model=model_name,
             temperature=temperature,
             timeout=timeout,
+            max_tokens=max_tokens,
         )
     else:
         api_url = (os.getenv("QIANFAN_BASE_URL") or DEFAULT_API_URL).strip()
@@ -463,4 +475,5 @@ def create_llm(*, temperature: float = 0, model: str | None = None, **kwargs: An
             model=model_name,
             temperature=temperature,
             timeout=timeout,
+            max_tokens=max_tokens,
         )

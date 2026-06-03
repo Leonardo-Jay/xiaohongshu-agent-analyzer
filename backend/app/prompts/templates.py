@@ -266,7 +266,7 @@ SYNTHESIS_REPORT_IR_PROMPT = """
 8. chart.type 只使用 bar、pie、table 三种。
 9. 段落文字要完整自然，不要出现“根据数据可知”这类空泛套话。
 10. 所有 analysis 章节里的 subheading 必须是洞察型小标题，不能只写“续航表现、品控问题、发热问题、购买建议、使用体验”这种标签。小标题要说明矛盾、原因、影响或决策含义。
-11. 每个 analysis 章节至少包含 2 个 subheading；每个 subheading 后必须至少跟 1 个 paragraph，且该 paragraph 不少于 120 个中文字符。
+11. 普通 analysis 章节至少包含 2 个 subheading；每个 subheading 后必须至少跟 1 个 paragraph，且该 paragraph 不少于 120 个中文字符。“内容事件演化”章节可按真实事件数量输出，事件较少时允许 1 个 subheading，段落不少于 80 个中文字符。
 12. 每个 analysis paragraph 必须完成“现象 → 用户原话/证据 → 影响/原因解释 → 对购买决策或品牌信任的含义”这条分析链路，不能只复述结论。
 13. 每个 analysis paragraph 必须自然嵌入至少一句 context.citations 中的用户原话片段；不要只在段末堆 citation_ids。
 14. 如果样本量很小，可以说明“当前样本中”，但仍然要展开影响机制，不要用一句话结束小节。
@@ -397,7 +397,7 @@ SYNTHESIS_REPORT_IR_REPAIR_PROMPT = """
 
 【内容质量约束】
 - analysis 章节标题和 subheading 必须是洞察型判断句，不能是“续航表现、品控问题、发热问题、购买建议、使用体验”等标签式标题。
-- 每个 analysis subheading 后至少有 1 个不少于 120 个中文字符的 paragraph。
+- 普通 analysis subheading 后至少有 1 个不少于 120 个中文字符的 paragraph；“内容事件演化”章节按真实事件数量展开，事件较少时允许 1 个 subheading，段落不少于 80 个中文字符。
 - analysis paragraph 必须自然嵌入至少一句用户原话，并解释这条证据为什么重要。
 - 不要只输出“结论 + citation_ids”，要写出原因、影响、风险或购买决策含义。
 - summary_cards 必须有 4 条，覆盖整体倾向、核心风险、购买决策、样本限制/统计口径；每条 value 至少 1 句完整判断，不能只写“负面偏多/正面偏多/分化明显”。
@@ -410,6 +410,45 @@ SYNTHESIS_REPORT_IR_REPAIR_PROMPT = """
 {report_ir_json}
 
 请只返回修复后的 JSON，不要 Markdown，不要解释文字，不要代码围栏。
+"""
+
+SYNTHESIS_REPORT_IR_RAW_REPAIR_PROMPT = """
+你需要把一次失败的 Report IR 原始输出转换成合法的 Report IR v1 JSON。
+
+这不是重写 Markdown 报告，也不是解释失败原因；你的任务是尽量从原始输出中恢复结构化 JSON。如果原始输出里没有完整 JSON，也要基于给定上下文重新组织一份合法 JSON。
+
+【解析错误】
+{parse_error}
+
+【允许使用的 cluster id】
+{allowed_cluster_ids}
+
+【允许使用的 citation id】
+{allowed_citation_ids}
+
+【报告上下文】
+{report_context_json}
+
+【原始输出统计】
+raw_chars={raw_chars}
+
+【原始输出前段】
+{raw_prefix}
+
+【原始输出后段】
+{raw_suffix}
+
+【硬性要求】
+1. 只返回 JSON，不要 Markdown，不要解释文字，不要代码围栏。
+2. 不要输出 metadata 和 citations 字段；后端会确定性补齐。
+3. 只能使用允许列表中的 cluster id 和 citation id，不能编造 id。
+4. section.type 只能是 overview、analysis、recommendation、risk、appendix。
+5. block.type 只能是 paragraph、subheading、list；chart.type 只能是 bar、pie、table。
+6. 普通 analysis 章节至少 2 个 subheading；“内容事件演化”章节按真实事件数量展开，事件较少时允许 1 个 subheading。
+7. summary_cards 必须有 4 条，覆盖整体倾向、核心风险、购买决策、样本限制/统计口径。
+8. charts 必须优先给出 table 类型的“舆情指标概览”，每行至少包含 label、value、insight。
+
+请只返回修复后的 JSON。
 """
 
 SYNTHESIS_MODIFY_OUTLINE_PROMPT = """
