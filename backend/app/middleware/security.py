@@ -2,6 +2,7 @@
 import os
 import time
 import re
+import ipaddress
 from collections import defaultdict
 from typing import Callable
 from fastapi import Request, Response
@@ -64,10 +65,14 @@ class SecurityMiddleware:
         rate_limit_per_minute: int = 100,
         rate_limit_per_hour: int = 500,
         block_duration_seconds: int = 600,
+        whitelist_ips: str | list[str] | None = None,
     ):
         self.rate_limit_per_minute = rate_limit_per_minute
         self.rate_limit_per_hour = rate_limit_per_hour
         self.block_duration = block_duration_seconds
+        self._whitelist_networks = self._parse_ip_whitelist(
+            whitelist_ips if whitelist_ips is not None else os.getenv("SECURITY_WHITELIST_IPS", "")
+        )
 
         # IP 访问记录 {ip: [(timestamp, path), ...]}
         self._ip_requests: dict[str, list[tuple[float, str]]] = defaultdict(list)
@@ -94,9 +99,10 @@ class SecurityMiddleware:
         path = request.url.path
         method = request.method
         user_agent = request.headers.get("user-agent", "").lower()
+        is_whitelisted_ip = self._is_whitelisted_ip(client_ip)
 
         # 1. 检查 IP 封禁状态
-        if self._is_ip_blocked(client_ip):
+        if not is_whitelisted_ip and self._is_ip_blocked(client_ip):
             return self._block_response("IP已被封禁")
 
         # 2. 检查 User-Agent 黑名单
@@ -123,13 +129,14 @@ class SecurityMiddleware:
             return self._block_response("检测到攻击行为")
 
         # 6. 频率限制
-        if self._is_rate_limited(client_ip):
+        if not is_whitelisted_ip and self._is_rate_limited(client_ip):
             self._log_attack(client_ip, path, "频率限制", user_agent)
             self._block_ip(client_ip)
             return self._block_response("请求过于频繁")
 
         # 记录请求
-        self._record_request(client_ip, path)
+        if not is_whitelisted_ip:
+            self._record_request(client_ip, path)
 
         # 继续处理请求
         response = await call_next(request)
@@ -159,6 +166,32 @@ class SecurityMiddleware:
     def _has_attack_pattern(self, text: str) -> bool:
         """检查是否包含攻击特征"""
         return any(pattern.search(text) for pattern in self._attack_patterns)
+
+    def _parse_ip_whitelist(self, value: str | list[str]) -> list[ipaddress._BaseNetwork]:
+        """解析白名单 IP 或 CIDR，多个值用逗号分隔。"""
+        items = value if isinstance(value, list) else str(value or "").split(",")
+        networks: list[ipaddress._BaseNetwork] = []
+        for item in items:
+            item = str(item).strip()
+            if not item:
+                continue
+            try:
+                networks.append(ipaddress.ip_network(item, strict=False))
+            except ValueError:
+                logger.warning("[Security] 忽略无效 IP 白名单项: {}", item)
+        if networks:
+            logger.info("[Security] 已启用 IP 白名单: {}", ", ".join(str(n) for n in networks))
+        return networks
+
+    def _is_whitelisted_ip(self, ip: str) -> bool:
+        """检查 IP 是否在频率限制白名单内。"""
+        if not self._whitelist_networks:
+            return False
+        try:
+            client_ip = ipaddress.ip_address(ip)
+        except ValueError:
+            return False
+        return any(client_ip in network for network in self._whitelist_networks)
 
     def _is_ip_blocked(self, ip: str) -> bool:
         """检查 IP 是否被封禁"""
