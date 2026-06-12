@@ -11,16 +11,23 @@ import json
 import os
 import time
 import uuid
-from typing import AsyncGenerator
+from typing import Annotated, Any, AsyncGenerator, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 from loguru import logger
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sse_starlette.sse import EventSourceResponse
 
 from app.graph.workflow import run_analysis
 from app.models.schemas import AnalysisRequest
+from app.tools.llm import (
+    LLMConfigError,
+    normalize_user_llm_config,
+    public_llm_config_info,
+    sanitize_llm_error,
+    llm_config_secret_values,
+)
 from app.tools.xhs_search_replay import is_xhs_full_mock_cookie, is_xhs_search_replay_cookie
 from app.utils.daily_audit_log import append_audit_log
 
@@ -36,11 +43,42 @@ _DEBUG_API_TOKEN = os.getenv("DEBUG_API_TOKEN", "").strip()
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
 
+class SystemLLMConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["system"]
+
+
+class BuiltinLLMConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["builtin"]
+    provider: Literal["qianfan", "longcat", "modelscope"]
+    model: str = Field(..., min_length=1, max_length=200)
+
+
+class CustomLLMConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["custom"]
+    api_type: Literal["openai-compatible", "anthropic-compatible"]
+    api_url: str = Field(..., min_length=1, max_length=2048)
+    model: str = Field(..., min_length=1, max_length=200)
+    api_key: str = Field(..., min_length=1, max_length=4096)
+
+
+UserLLMConfig = Annotated[
+    SystemLLMConfig | BuiltinLLMConfig | CustomLLMConfig,
+    Field(discriminator="mode"),
+]
+
+
 class AnalysisRequestV2(BaseModel):
     query: str = Field(..., min_length=1, max_length=200, description="产品舆情分析关键词")
     session_id: str | None = Field(None, description="可选会话 ID，用于复用或幂等")
     cookie: str | None = Field(None, description="用户提供的小红书 Cookie，覆盖 .env")
     enable_memory: bool | None = Field(None, description="是否开启记忆功能，覆盖环境变量 ENABLE_MEMORY")
+    llm_config: UserLLMConfig | None = Field(None, description="请求级 LLM 配置")
 
     @field_validator("query")
     @classmethod
@@ -64,6 +102,13 @@ async def start_analysis(req: AnalysisRequestV2, request: Request):
     """
     run_id = str(uuid.uuid4())
     client_ip = request.client.host if request.client else "unknown"
+    normalized_llm_config: dict[str, Any] | None = None
+    try:
+        normalized_llm_config = normalize_user_llm_config(
+            req.llm_config.model_dump() if req.llm_config else None
+        )
+    except LLMConfigError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     if req.session_id and any(
         task.get("session_id") == req.session_id and task.get("status") == "running"
@@ -88,6 +133,7 @@ async def start_analysis(req: AnalysisRequestV2, request: Request):
         cookie=req.cookie,
         enable_memory=req.enable_memory,
         session_id=req.session_id,
+        llm_config=normalized_llm_config,
     ))
     _tasks[run_id]["task"] = task
     logger.info(f"[Routes] 任务启动 run_id={run_id} query={req.query}")
@@ -98,6 +144,7 @@ async def start_analysis(req: AnalysisRequestV2, request: Request):
         query=req.query,
         session_id=req.session_id,
         has_cookie_override=bool(req.cookie and req.cookie.strip()),
+        **public_llm_config_info(normalized_llm_config),
     )
     return {"run_id": run_id, "query": req.query}
 
@@ -109,10 +156,19 @@ async def _run_and_cleanup(
     cookie: str | None = None,
     enable_memory: bool | None = None,
     session_id: str | None = None,
+    llm_config: dict[str, Any] | None = None,
 ) -> None:
     cancelled = False
     try:
-        await run_analysis(query, run_id, q, cookie=cookie, enable_memory=enable_memory, session_id=session_id)
+        await run_analysis(
+            query,
+            run_id,
+            q,
+            cookie=cookie,
+            enable_memory=enable_memory,
+            session_id=session_id,
+            llm_config=llm_config,
+        )
         if run_id in _tasks:
             _tasks[run_id]["status"] = "done"
             append_audit_log(
@@ -140,7 +196,10 @@ async def _run_and_cleanup(
                     duration_seconds=round(time.time() - _tasks[run_id].get("started_at", time.time()), 2),
                 )
             raise
-        exc_repr = f"[{type(e).__name__}] {e!r}"
+        exc_repr = sanitize_llm_error(
+            f"[{type(e).__name__}] {e!r}",
+            llm_config_secret_values(llm_config),
+        )
         logger.error(f"[Routes] 未捕获异常 run_id={run_id}: {exc_repr}")
         q.put_nowait({"event": "error", "data": {"code": "INTERNAL_ERROR", "message": exc_repr}})
         q.put_nowait(None)

@@ -10,6 +10,7 @@
         <el-radio-button label="ink">水墨</el-radio-button>
         <el-radio-button label="classic">经典</el-radio-button>
       </el-radio-group>
+      <el-button class="config-button llm-config-button" @click="llmConfigVisible=true">配置 LLM</el-button>
       <el-button class="config-button" @click="configVisible=true">配置 Cookie</el-button>
     </div>
 
@@ -179,6 +180,85 @@
       </div>
     </div>
 
+    <!-- LLM 配置弹窗 -->
+    <el-dialog v-model="llmConfigVisible" title="配置 LLM" width="560px" class="llm-config-dialog" :close-on-click-modal="false">
+      <el-radio-group v-model="llmConfig.mode" class="llm-mode-switch" aria-label="LLM 配置模式">
+        <el-radio-button label="system">系统默认</el-radio-button>
+        <el-radio-button label="builtin">内置提供商</el-radio-button>
+        <el-radio-button label="custom">自定义接口</el-radio-button>
+      </el-radio-group>
+
+      <div v-if="llmConfig.mode === 'system'" class="llm-config-panel">
+        <el-alert
+          type="info"
+          :closable="false"
+          show-icon
+          title="使用系统推荐模型"
+          description="适合大多数分析场景，无需额外配置，直接使用平台默认的大模型能力。"
+        />
+      </div>
+
+      <el-form v-else label-position="top" class="llm-config-form">
+        <template v-if="llmConfig.mode === 'builtin'">
+          <el-form-item label="内置提供商">
+            <el-select v-model="llmConfig.provider" class="llm-config-field" @change="syncBuiltinModel">
+              <el-option
+                v-for="provider in builtinProviders"
+                :key="provider.value"
+                :label="provider.label"
+                :value="provider.value"
+              />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="模型">
+            <el-select v-model="llmConfig.model" class="llm-config-field">
+              <el-option
+                v-for="model in builtinModelOptions"
+                :key="model"
+                :label="model"
+                :value="model"
+              />
+            </el-select>
+          </el-form-item>
+          <div class="llm-config-tip">
+            选择平台已接入的模型即可开始分析，无需填写密钥，适合想快速切换模型效果的场景。
+          </div>
+        </template>
+
+        <template v-else>
+          <el-form-item label="API 类型">
+            <el-select v-model="llmConfig.api_type" class="llm-config-field">
+              <el-option label="OpenAI Compatible" value="openai-compatible" />
+              <el-option label="Anthropic Compatible" value="anthropic-compatible" />
+            </el-select>
+          </el-form-item>
+          <el-form-item label="API URL">
+            <el-input v-model="llmConfig.api_url" placeholder="https://example.com/v1/chat/completions" />
+          </el-form-item>
+          <el-form-item label="模型调用名">
+            <el-input v-model="llmConfig.model" placeholder="例如 gpt-4o-mini 或 claude-sonnet-4-5" />
+          </el-form-item>
+          <el-form-item label="API Key">
+            <el-input
+              v-model="llmConfig.api_key"
+              type="password"
+              show-password
+              placeholder="请输入仅用于本浏览器和本次请求的 API Key"
+              autocomplete="off"
+            />
+          </el-form-item>
+          <div class="llm-config-tip">
+            适合使用自己的模型服务。请确认接口兼容 OpenAI 或 Anthropic 调用格式，密钥仅用于发起本次分析请求。
+          </div>
+        </template>
+      </el-form>
+
+      <template #footer>
+        <el-button @click="llmConfigVisible=false">取消</el-button>
+        <el-button type="primary" @click="saveLlmConfig">保存</el-button>
+      </template>
+    </el-dialog>
+
     <!-- Cookie 配置弹窗 -->
     <el-dialog v-model="configVisible" title="配置小红书 Cookie" width="520px" :close-on-click-modal="false">
       <el-input
@@ -221,10 +301,144 @@ const hotspotLayoutClass = computed(() => getHotspotLayoutClass(visibleHotspotGr
 const THEME_STORAGE_KEY = 'xhs_home_theme'
 const savedTheme = localStorage.getItem(THEME_STORAGE_KEY)
 const themeMode = ref(savedTheme === 'classic' ? 'classic' : 'ink')
+const LLM_CONFIG_STORAGE_KEY = 'xhs_user_llm_config'
+const builtinProviders = [
+  { value: 'qianfan', label: '千帆' },
+  { value: 'longcat', label: 'LongCat' },
+  { value: 'modelscope', label: 'ModelScope' }
+]
+const builtinModels = {
+  qianfan: [
+    'deepseek-v4-pro',
+    'deepseek-v4-flash',
+    'deepseek-v3.2',
+    'ernie-lite-pro-128k',
+    'ernie-speed-pro-128k',
+    'ernie-4.5-turbo-128k',
+    'qwen3-coder-30b-a3b-instruct',
+    'qwen3-30b-a3b',
+    'qwen3-14b'
+  ],
+  longcat: ['LongCat-2.0-Preview'],
+  modelscope: [
+    'moonshotai/Kimi-K2.6',
+    'MiniMax/MiniMax-M2.7',
+    'ZhipuAI/GLM-4.7-Flash',
+    'deepseek-ai/DeepSeek-R1-Distill-Qwen-32B'
+  ]
+}
+
+function defaultLlmConfig() {
+  return {
+    mode: 'system',
+    provider: 'qianfan',
+    model: builtinModels.qianfan[0],
+    api_type: 'openai-compatible',
+    api_url: '',
+    api_key: ''
+  }
+}
+
+function loadLlmConfig() {
+  try {
+    const raw = localStorage.getItem(LLM_CONFIG_STORAGE_KEY)
+    if (!raw) return defaultLlmConfig()
+    const parsed = JSON.parse(raw)
+    const next = { ...defaultLlmConfig(), ...parsed }
+    if (!['system', 'builtin', 'custom'].includes(next.mode)) next.mode = 'system'
+    if (!builtinModels[next.provider]) next.provider = 'qianfan'
+    if (next.mode === 'builtin' && !builtinModels[next.provider].includes(next.model)) {
+      next.model = builtinModels[next.provider][0]
+    }
+    if (!['openai-compatible', 'anthropic-compatible'].includes(next.api_type)) {
+      next.api_type = 'openai-compatible'
+    }
+    return next
+  } catch {
+    return defaultLlmConfig()
+  }
+}
+
+const llmConfigVisible = ref(false)
+const llmConfig = ref(loadLlmConfig())
+const builtinModelOptions = computed(() => builtinModels[llmConfig.value.provider] || [])
 
 watch(themeMode, (mode) => {
   localStorage.setItem(THEME_STORAGE_KEY, mode === 'classic' ? 'classic' : 'ink')
 })
+
+function syncBuiltinModel() {
+  const models = builtinModels[llmConfig.value.provider] || []
+  if (!models.includes(llmConfig.value.model)) {
+    llmConfig.value.model = models[0] || ''
+  }
+}
+
+function validateLlmConfig() {
+  const cfg = llmConfig.value
+  if (cfg.mode === 'system') return true
+  if (cfg.mode === 'builtin') {
+    syncBuiltinModel()
+    if (!cfg.provider || !builtinModels[cfg.provider]?.includes(cfg.model)) {
+      ElMessage.error('请选择有效的内置提供商和模型')
+      return false
+    }
+    return true
+  }
+  if (!cfg.api_type || !cfg.api_url.trim() || !cfg.model.trim() || !cfg.api_key.trim()) {
+    ElMessage.error('请填写完整的自定义 LLM 配置')
+    return false
+  }
+  if (!['openai-compatible', 'anthropic-compatible'].includes(cfg.api_type)) {
+    ElMessage.error('请选择有效的 API 类型')
+    return false
+  }
+  try {
+    const url = new URL(cfg.api_url.trim())
+    if (!['https:', 'http:'].includes(url.protocol)) throw new Error('bad protocol')
+  } catch {
+    ElMessage.error('请输入合法的 API URL')
+    return false
+  }
+  return true
+}
+
+function saveLlmConfig() {
+  if (!validateLlmConfig()) return
+  const cfg = {
+    ...llmConfig.value,
+    api_url: llmConfig.value.api_url.trim(),
+    model: llmConfig.value.model.trim(),
+    api_key: llmConfig.value.api_key.trim()
+  }
+  llmConfig.value = cfg
+  localStorage.setItem(LLM_CONFIG_STORAGE_KEY, JSON.stringify(cfg))
+  llmConfigVisible.value = false
+  ElMessage.success('LLM 配置已保存')
+}
+
+function buildLlmConfigPayload() {
+  const cfg = llmConfig.value
+  if (!cfg || cfg.mode === 'system') return undefined
+  if (!validateLlmConfig()) {
+    llmConfigVisible.value = true
+    throw new Error('请先完成 LLM 配置')
+  }
+  if (cfg.mode === 'builtin') {
+    return {
+      mode: 'builtin',
+      provider: cfg.provider,
+      model: cfg.model
+    }
+  }
+  return {
+    mode: 'custom',
+    api_type: cfg.api_type,
+    api_url: cfg.api_url.trim(),
+    model: cfg.model.trim(),
+    api_key: cfg.api_key.trim()
+  }
+}
 
 onMounted(() => {
   fetchHomeHotspots()
@@ -409,6 +623,13 @@ async function startAnalysis() {
     }
   }
 
+  let llmConfigPayload
+  try {
+    llmConfigPayload = buildLlmConfigPayload()
+  } catch {
+    return
+  }
+
   started.value = true
   loading.value = true
   stages.value = []
@@ -425,7 +646,8 @@ async function startAnalysis() {
         query: query.value.trim(),
         session_id: getSessionId(),
         cookie: cookieInput.value.trim() || undefined,
-        enable_memory: enableMemory.value
+        enable_memory: enableMemory.value,
+        ...(llmConfigPayload ? { llm_config: llmConfigPayload } : {})
       }),
     })
     if (!resp.ok) {
@@ -1256,6 +1478,9 @@ async function downloadWord() {
 .config-button {
   flex-shrink: 0;
 }
+.llm-config-button {
+  min-width: 94px;
+}
 
 .aside-header {
   background: #eefaff;  /* 浅灰色圆角横条 */
@@ -1928,6 +2153,19 @@ async function downloadWord() {
   border-radius: 8px;
   border: 1px solid rgba(0,0,0,0.06);
 }
+.llm-mode-switch {
+  margin-bottom: 18px;
+}
+.llm-config-panel,
+.llm-config-form {
+  margin-top: 4px;
+}
+.llm-config-field {
+  width: 100%;
+}
+.llm-config-dialog :deep(.el-dialog__body) {
+  padding-top: 10px;
+}
 .post-reading-box {
   margin-top: 8px;
   height: 110px; /* 固定高度，不会因为内容增加把下方布局往下顶 */
@@ -2565,6 +2803,8 @@ async function downloadWord() {
     right: 0;
     z-index: 220;
     width: 100%;
+    flex-wrap: wrap;
+    align-items: center;
     justify-content: space-between;
     gap: 10px;
     padding: calc(env(safe-area-inset-top, 0px) + 8px) 14px 8px;
@@ -2587,6 +2827,9 @@ async function downloadWord() {
   .config-button {
     min-height: 32px;
     padding: 7px 10px;
+  }
+  .llm-config-button {
+    min-width: 88px;
   }
   .hero {
     height: auto;
@@ -2841,6 +3084,7 @@ async function downloadWord() {
   .page-actions {
     gap: 8px;
     padding: calc(env(safe-area-inset-top, 0px) + 7px) 10px 7px;
+    justify-content: flex-end;
   }
   .brand {
     font-size: clamp(36px, 8.5vw, 40px);

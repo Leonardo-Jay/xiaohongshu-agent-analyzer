@@ -116,6 +116,7 @@ class GraphState(TypedDict, total=False):
     _session_intent_frame: dict[str, Any]
     _session_last_run_ref: dict[str, Any]
     _last_run_ref: dict[str, Any]
+    _llm_config: dict[str, Any]
 
     # ── 错误跟踪（累加型）
     _critical_errors: Annotated[list[dict[str, Any]], operator.add]

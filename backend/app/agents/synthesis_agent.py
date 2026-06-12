@@ -32,9 +32,8 @@ from app.prompts.templates import (
 from app.reports.renderer import render_markdown
 from app.tools.llm import create_llm
 
-# 规划与 Report IR JSON 生成更容易出现长响应，给非流式调用更宽松的超时。
-_llm_plan = create_llm(temperature=0.1, timeout=180.0, max_tokens=8192)
-_llm_report = create_llm(temperature=0.3)
+_llm_plan = None
+_llm_report = None
 
 _MAX_SYNTHESIS_ROUNDS = 3
 _MAX_IR_CLUSTERS = 10
@@ -122,6 +121,28 @@ _CHART_TYPE_ALIASES = {
     "pie_chart": "pie",
     "table": "table",
 }
+
+
+def _create_plan_llm(state: GraphState):
+    if state.get("_llm_config"):
+        return create_llm(
+            temperature=0.1,
+            timeout=180.0,
+            max_tokens=8192,
+            llm_config=state.get("_llm_config"),
+        )
+    if _llm_plan is not None:
+        return _llm_plan
+    return create_llm(temperature=0.1, timeout=180.0, max_tokens=8192)
+
+
+def _create_report_llm(state: GraphState):
+    if state.get("_llm_config"):
+        return create_llm(temperature=0.3, llm_config=state.get("_llm_config"))
+    if _llm_report is not None:
+        return _llm_report
+    return create_llm(temperature=0.3)
+
 
 def _strip_fences(text: str) -> str:
     """去除 LLM 报告输出中可能加的 markdown/代码围栏。"""
@@ -238,11 +259,12 @@ async def _invoke_report_ir_llm(
     *,
     context: dict[str, Any],
     stage: str,
+    llm: Any,
 ) -> tuple[str, str]:
     """Use non-streaming completion first; stream only as transport fallback."""
     try:
-        response = await _llm_plan.ainvoke(prompt)
-        raw_text = _llm_plan._normalize_text(response.content)
+        response = await llm.ainvoke(prompt)
+        raw_text = llm._normalize_text(response.content)
         finish_reason = getattr(response, "finish_reason", "") or ""
         _log_report_ir_raw(
             stage=stage,
@@ -260,9 +282,9 @@ async def _invoke_report_ir_llm(
             exc,
         )
         buffer = ""
-        async for chunk in _llm_plan.astream(prompt):
+        async for chunk in llm.astream(prompt):
             buffer += chunk
-        raw_text = _llm_plan._normalize_text(buffer)
+        raw_text = llm._normalize_text(buffer)
         _log_report_ir_raw(
             stage=f"{stage}_stream_fallback",
             raw_text=raw_text,
@@ -280,6 +302,7 @@ async def _repair_unparseable_report_ir(
     parse_error: Exception,
     context: dict[str, Any],
     prompt_context: dict[str, Any],
+    llm: Any,
 ) -> dict[str, Any]:
     logger.warning(
         "[Synthesis][ReportIR] JSON 提取失败，进入 raw-text repair: type={}, error={!r}, raw_chars={}",
@@ -300,6 +323,7 @@ async def _repair_unparseable_report_ir(
         repair_prompt,
         context=context,
         stage="raw_text_repair",
+        llm=llm,
     )
     try:
         return _extract_json_object(repair_text)
@@ -1044,6 +1068,7 @@ def _minimal_report_ir(state: GraphState, final_text: str = "") -> ReportIR:
 
 async def _generate_report_ir(state: GraphState) -> ReportIR:
     context = _build_report_context(state)
+    llm_plan = _create_plan_llm(state)
     metadata = _build_report_metadata(state)
     citations = context.pop("_citation_registry")
     prompt_context = {k: v for k, v in context.items() if not k.startswith("_")}
@@ -1058,6 +1083,7 @@ async def _generate_report_ir(state: GraphState) -> ReportIR:
         prompt,
         context=context,
         stage="initial",
+        llm=llm_plan,
     )
     try:
         raw_data = _extract_json_object(raw_text)
@@ -1067,6 +1093,7 @@ async def _generate_report_ir(state: GraphState) -> ReportIR:
             parse_error=exc,
             context=context,
             prompt_context=prompt_context,
+            llm=llm_plan,
         )
 
     try:
@@ -1093,6 +1120,7 @@ async def _generate_report_ir(state: GraphState) -> ReportIR:
         repair_prompt,
         context=context,
         stage="validation_repair",
+        llm=llm_plan,
     )
     try:
         repaired_data = _extract_json_object(repair_text)
@@ -1102,6 +1130,7 @@ async def _generate_report_ir(state: GraphState) -> ReportIR:
             parse_error=exc,
             context=context,
             prompt_context=prompt_context,
+            llm=llm_plan,
         )
     try:
         repaired = _sanitize_report_ir(
@@ -1166,7 +1195,8 @@ async def node_plan_outline(state: GraphState) -> dict[str, Any]:
         logger.info(f"[Synthesis][Plan] Round {round_num}: 开始起草报告大纲...")
 
     try:
-        resp = await _llm_plan.ainvoke(prompt)
+        llm_plan = _create_plan_llm(state)
+        resp = await llm_plan.ainvoke(prompt)
         outline_json = _parse_json_response(resp.content)
     except Exception as e:
         logger.error(f"[Synthesis][Plan] Error: {e}")
@@ -1325,10 +1355,11 @@ async def _legacy_execute_markdown_report(state: GraphState, config: dict) -> di
     logger.info(f"[Synthesis][Execute] 正在发出的最终提示词 (前500字): \n{prompt[:500]}...")
 
     max_retries = 2
+    llm_report = _create_report_llm(state)
     for attempt in range(max_retries + 1):
         try:
             buffer = ""
-            async for chunk in _llm_report.astream(prompt):
+            async for chunk in llm_report.astream(prompt):
                 buffer += chunk
                 cleaned = _strip_fences(buffer)
                 if queue:

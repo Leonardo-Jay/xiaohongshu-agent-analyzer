@@ -49,6 +49,7 @@ from app.agents.retrieve_agent import build_retrieve_graph
 from app.agents.screen_agent import build_screen_graph
 from app.models.schemas import GraphState
 from app.tools.mcp_client import XhsMcpClient, XhsMcpClientPool
+from app.tools.llm import llm_config_secret_values, sanitize_llm_error
 from app.tools.xhs_apihz import fetch_posts_detail_batch, is_apihz_configured
 from app.tools.xhs_search_replay import (
     XhsSearchReplayError,
@@ -152,6 +153,7 @@ async def run_analysis(
     cookie: str | None = None,
     enable_memory: bool | None = None,
     session_id: str | None = None,
+    llm_config: dict[str, Any] | None = None,
 ) -> None:
     """在后台 task 中执行全流程，结果/错误通过 queue 发送。"""
     replay_mode = is_xhs_search_replay_cookie(cookie)
@@ -208,6 +210,7 @@ async def run_analysis(
         "_session_intent_frame": {},
         "_session_last_run_ref": {},
         "_last_run_ref": {},
+        "_llm_config": llm_config or {},
         # 其他阶段
         "screened_items": [],
         "screening_stats": {},
@@ -656,7 +659,10 @@ async def run_analysis(
                 run_id=run_id,
                 query=query,
                 status="failed",
-                error_message=f"{e.code}: {e.message}",
+                error_message=sanitize_llm_error(
+                    f"{e.code}: {e.message}",
+                    llm_config_secret_values(llm_config),
+                ),
                 retrieved_post_count=len(state.get("retrieved_posts", [])),
                 screened_count=len(state.get("screened_items", [])),
                 comment_count=len(state.get("retrieved_comments", [])),
@@ -677,6 +683,7 @@ async def run_analysis(
                 message = f"[{exc_type}] {exc_msg}"
             if not message:
                 message = f"[{exc_type}] (no details)"
+            message = sanitize_llm_error(message, llm_config_secret_values(llm_config))
             print(f"[WORKFLOW EXCEPT] {message}", file=sys.stderr, flush=True)
             logger.error(f"[Workflow] run_id={run_id} FAILED: {message}")
             append_audit_log(

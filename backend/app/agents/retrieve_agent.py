@@ -27,7 +27,7 @@ from app.tools.mcp_client import XhsMcpClient, XhsMcpClientPool
 from app.tools.tool_schemas import RETRIEVE_TOOLS
 from app.utils.temporal import parse_xhs_time, within_window
 
-_llm = create_llm(temperature=0)
+_llm = None
 
 _MAX_RETRIEVE_ROUNDS = 3
 _MIN_POSTS = 7
@@ -39,6 +39,14 @@ _RETRIEVAL_SORT_PLANS = {
     "comment_hot": [3, 0],
     "like_hot": [2, 0],
 }
+
+
+def _create_state_llm(state: GraphState, **kwargs: Any):
+    if state.get("_llm_config"):
+        return create_llm(llm_config=state.get("_llm_config"), **kwargs)
+    if _llm is not None:
+        return _llm
+    return create_llm(**kwargs)
 
 
 async def _execute_retrieve_tool(
@@ -255,11 +263,12 @@ async def node_retrieve_fc(state: GraphState, config: dict[str, Any]) -> dict[st
     existing_ids = {p["note_id"] for p in retrieved_posts if p.get("note_id")}
     exclude_set = set(exclude_note_ids)
     sort_plan = _sort_plan_for_context(temporal_context)
+    llm = _create_state_llm(state, temperature=0)
 
     # Function Calling 多轮循环
     for iteration in range(_MAX_FC_ITERATIONS):
         try:
-            resp = await _llm.ainvoke(messages, tools=RETRIEVE_TOOLS)
+            resp = await llm.ainvoke(messages, tools=RETRIEVE_TOOLS)
         except Exception as e:
             logger.warning(f"[Retrieve][FC] LLM 调用失败 iteration={iteration}: {e}")
             break

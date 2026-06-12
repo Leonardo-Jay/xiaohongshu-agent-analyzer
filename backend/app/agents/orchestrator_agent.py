@@ -27,8 +27,8 @@ from app.tools.current_time import current_time_client
 from app.tools.tool_schemas import INTENT_TOOLS, ORCHESTRATOR_TOOLS
 from app.utils.temporal import infer_temporal_context, normalize_temporal_context
 
-_llm_reasoning = create_llm(temperature=0)
-_llm_action = create_llm(temperature=0)
+_llm_reasoning = None
+_llm_action = None
 
 _MAX_INTENT_ROUNDS = 4  # 最多 2 轮 ReAct 循环
 _MAX_FC_ITERATIONS = 4  # Action 节点 Function Calling 最大迭代次数
@@ -95,6 +95,14 @@ _TOPIC_PREFIX_QUALIFIERS = (
     "惠农",
     "助农",
 )
+
+
+def _create_state_llm(state: GraphState, fallback: Any = None, **kwargs: Any):
+    if state.get("_llm_config"):
+        return create_llm(llm_config=state.get("_llm_config"), **kwargs)
+    if fallback is not None:
+        return fallback
+    return create_llm(**kwargs)
 
 
 def _dedupe_keep_order(values: list[str]) -> list[str]:
@@ -254,9 +262,10 @@ async def node_reasoning(state: GraphState) -> dict[str, Any]:
         )
 
     messages: list[dict] = [{"role": "user", "content": prompt}]
+    llm_reasoning = _create_state_llm(state, fallback=_llm_reasoning, temperature=0)
 
     try:
-        resp = await _llm_reasoning.ainvoke(messages, tools=INTENT_TOOLS)
+        resp = await llm_reasoning.ainvoke(messages, tools=INTENT_TOOLS)
 
         if resp.tool_calls and resp.tool_calls[0].name == "analyze_intent":
             data = resp.tool_calls[0].arguments
@@ -427,7 +436,8 @@ async def _supplement_analysis(
 - 例如“吴克群助农卖菜”应输出 product_entities=["吴克群"]，不要输出 ["吴克群助农"]。"""
 
     try:
-        resp = await _llm_action.ainvoke(
+        llm_action = _create_state_llm(state, fallback=_llm_action, temperature=0)
+        resp = await llm_action.ainvoke(
             [{"role": "user", "content": prompt}],
             tools=INTENT_TOOLS,
         )
@@ -532,6 +542,7 @@ async def node_action(state: GraphState) -> dict[str, Any]:
     )
 
     messages: list[dict] = [{"role": "user", "content": system_prompt}]
+    llm_action = _create_state_llm(state, fallback=_llm_action, temperature=0)
 
     hot_topics_called = False
     hot_topics_results: list[dict] = []
@@ -549,7 +560,7 @@ async def node_action(state: GraphState) -> dict[str, Any]:
 
     for iteration in range(_MAX_FC_ITERATIONS):
         try:
-            resp = await _llm_action.ainvoke(messages, tools=ORCHESTRATOR_TOOLS)
+            resp = await llm_action.ainvoke(messages, tools=ORCHESTRATOR_TOOLS)
         except Exception as e:
             logger.warning(f"[Orchestrator][Action] FC iteration={iteration} failed: {e}")
             break
@@ -621,7 +632,7 @@ async def node_action(state: GraphState) -> dict[str, Any]:
         messages.append({"role": "user", "content": prompt_decision})
 
         try:
-            resp = await _llm_action.ainvoke(messages, tools=ORCHESTRATOR_TOOLS)
+            resp = await llm_action.ainvoke(messages, tools=ORCHESTRATOR_TOOLS)
             if resp.tool_calls:
                 for tc in resp.tool_calls:
                     if tc.name == "update_intent_analysis":

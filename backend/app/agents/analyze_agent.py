@@ -35,7 +35,7 @@ from app.tools.mcp_client import XhsMcpClientPool
 from app.tools.tool_schemas import ANALYZE_TOOLS
 from app.utils.temporal import parse_xhs_time
 
-_llm = create_llm(temperature=0)
+_llm = None
 
 _MAX_ANALYZE_ROUNDS = 2
 _MIN_COMMENTS = 40
@@ -44,6 +44,14 @@ _TOP_POSTS_PER_ROUND = 3
 _MAX_EVIDENCE_FOR_CLUSTERING = 200
 _MAX_EVIDENCE_FOR_TIME_ANALYSIS = 60
 _BANNED_CONTENT_TIME_TERMS = ("较早样本", "中后段样本", "爆发期", "扩散期", "沉淀期", "复燃期", "传播生命周期")
+
+
+def _create_state_llm(state: GraphState, **kwargs: Any):
+    if state.get("_llm_config"):
+        return create_llm(llm_config=state.get("_llm_config"), **kwargs)
+    if _llm is not None:
+        return _llm
+    return create_llm(**kwargs)
 
 
 def _is_valid_comment(content: str) -> bool:
@@ -389,11 +397,12 @@ async def node_fetch_comments_fc(state: GraphState, config: dict) -> dict[str, A
     all_new_comments: list[dict] = []
     selected_ids: list[str] = []
     total_filtered = 0
+    llm = _create_state_llm(state, temperature=0)
 
     # Function Calling 多轮循环
     for _ in range(base_num + 2):
         try:
-            resp = await _llm.ainvoke(messages, tools=ANALYZE_TOOLS)
+            resp = await llm.ainvoke(messages, tools=ANALYZE_TOOLS)
         except Exception as e:
             logger.warning(f"[Analyze][FC] LLM 调用失败: {e}")
             break
@@ -532,7 +541,8 @@ async def node_cluster_opinions(state: GraphState, config: dict) -> dict[str, An
     )
 
     try:
-        resp = await asyncio.wait_for(_llm.ainvoke(prompt), timeout=60.0)
+        llm = _create_state_llm(state, temperature=0)
+        resp = await asyncio.wait_for(llm.ainvoke(prompt), timeout=60.0)
         data = _load_json_payload(resp.content)
         clusters = data.get("clusters", [])
         if not clusters:
@@ -600,7 +610,8 @@ async def node_validate_clusters(state: GraphState, config: dict) -> dict[str, A
     )
 
     try:
-        resp = await asyncio.wait_for(_llm.ainvoke(prompt), timeout=30.0)
+        llm = _create_state_llm(state, temperature=0)
+        resp = await asyncio.wait_for(llm.ainvoke(prompt), timeout=30.0)
         data = json.loads(resp.content)
         validated_clusters = data.get("clusters", [])
 
@@ -795,7 +806,8 @@ async def node_analyze_content_time(state: GraphState, config: dict) -> dict[str
     allowed_cluster_ids = {row["cluster_id"] for row in compact_clusters}
     allowed_evidence_ids = {item["evidence_id"] for item in registry}
     try:
-        resp = await asyncio.wait_for(_llm.ainvoke(prompt), timeout=30.0)
+        llm = _create_state_llm(state, temperature=0)
+        resp = await asyncio.wait_for(llm.ainvoke(prompt), timeout=30.0)
         payload = json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", resp.content.strip()))
     except Exception as e:
         logger.warning(f"[Analyze][ContentTime] 生成失败，使用空结果: {e}")

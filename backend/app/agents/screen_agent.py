@@ -28,8 +28,8 @@ from app.models.schemas import GraphState
 from app.prompts.templates import SCREEN_AD_DETECT_PROMPT, SCREEN_RELEVANCE_PROMPT
 from app.tools.llm import create_llm
 
-_llm_ad_detect = create_llm(temperature=0)
-_llm_relevance = create_llm(temperature=0)
+_llm_ad_detect = None
+_llm_relevance = None
 
 _MAX_SCREEN_ROUNDS = 2  # 最多 2 轮筛选
 _MIN_POSTS = 5  # 最少输出帖子数
@@ -50,6 +50,14 @@ CONTACT_PATTERNS = [
     r"公众号 [：:]\s*\w+",
     r"微博 [：:]\s*\w+",
 ]
+
+
+def _create_state_llm(state: GraphState, fallback: Any = None, **kwargs: Any):
+    if state.get("_llm_config"):
+        return create_llm(llm_config=state.get("_llm_config"), **kwargs)
+    if fallback is not None:
+        return fallback
+    return create_llm(**kwargs)
 
 
 def _has_ad_keywords(text: str) -> bool:
@@ -196,6 +204,7 @@ async def node_detect_ads(state: GraphState) -> dict[str, Any]:
 
     ad_detected = []
     genuine_posts = []
+    llm_ad_detect = _create_state_llm(state, fallback=_llm_ad_detect, temperature=0)
 
     sem = asyncio.Semaphore(5)
 
@@ -213,7 +222,7 @@ async def node_detect_ads(state: GraphState) -> dict[str, Any]:
 
         try:
             async with sem:
-                resp = await _llm_ad_detect.ainvoke(prompt)
+                resp = await llm_ad_detect.ainvoke(prompt)
             data = _parse_json_response(resp.content)
 
             is_hard_ad = data.get("is_hard_ad", False)
@@ -319,6 +328,7 @@ async def node_rank_and_select(state: GraphState) -> dict[str, Any]:
 
     # 对每篇帖子进行相关性评分
     scored_posts = []
+    llm_relevance = _create_state_llm(state, fallback=_llm_relevance, temperature=0)
 
     # 构建 key_aspects 和 user_needs 的字符串描述
     aspects_str = "、".join([a.get("aspect", "") for a in key_aspects]) if key_aspects else "无"
@@ -341,7 +351,7 @@ async def node_rank_and_select(state: GraphState) -> dict[str, Any]:
 
         try:
             async with sem:
-                resp = await _llm_relevance.ainvoke(prompt)
+                resp = await llm_relevance.ainvoke(prompt)
             data = _parse_json_response(resp.content)
 
             score = float(data.get("relevance_score", 0.5))
